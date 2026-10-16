@@ -508,7 +508,9 @@ private fun HomePromoBanner(
         ) {
             ProductVisual(
                 imageUrl = "apple",
-                size = 96.dp
+                size = 96.dp,
+                backgroundColor = Color.Transparent,
+                contentDescription = "عروض الموسم"
             )
         }
     }
@@ -575,7 +577,9 @@ private fun HomeCategorySection(
                     ) {
                         ProductVisual(
                             imageUrl = sampleKey,
-                            size = 38.dp
+                            size = 38.dp,
+                            backgroundColor = Color.Transparent,
+                            contentDescription = categoryName
                         )
                     }
                     Spacer(modifier = Modifier.height(6.dp))
@@ -713,16 +717,19 @@ fun ProductCard(
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            // Centered Product Illustration
+            // Centered Product Photography Container
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(110.dp),
+                    .height(115.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFFFAFCFA)),
                 contentAlignment = Alignment.Center
             ) {
                 ProductVisual(
                     imageUrl = product.imageUrl,
-                    size = 100.dp,
+                    size = 105.dp,
+                    backgroundColor = Color.Transparent,
                     contentDescription = product.name
                 )
             }

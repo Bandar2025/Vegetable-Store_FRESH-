@@ -21,22 +21,25 @@ import coil.request.ImageRequest
 import com.example.R
 
 /**
- * Resolves produce image identifiers to locally bundled high-quality photography assets.
- * Guarantees that every known product type receives its matching photo.
+ * Resolves produce image identifiers, file names, or keywords to locally bundled high-quality photography assets.
+ * Handles null, empty, unknown, uppercase, file extensions, and keywords safely.
  */
 @DrawableRes
 fun resolveProduceDrawable(imageUrl: String?): Int {
-    return when (imageUrl?.lowercase()?.trim()) {
-        "apple" -> R.drawable.img_product_apple
-        "banana" -> R.drawable.img_product_banana
-        "tomato" -> R.drawable.img_product_tomato
-        "lettuce" -> R.drawable.img_product_lettuce
-        "carrot" -> R.drawable.img_product_carrot
-        "orange" -> R.drawable.img_product_orange
-        "dates" -> R.drawable.img_product_dates
-        "cucumber" -> R.drawable.img_product_cucumber
-        "mint" -> R.drawable.img_product_mint
-        "avocado" -> R.drawable.img_product_avocado
+    val clean = imageUrl?.lowercase()?.trim() ?: return R.drawable.ic_produce_placeholder
+    if (clean.isBlank()) return R.drawable.ic_produce_placeholder
+
+    return when {
+        clean.contains("apple") || clean.contains("تفاح") -> R.drawable.img_product_apple
+        clean.contains("banana") || clean.contains("موز") -> R.drawable.img_product_banana
+        clean.contains("tomato") || clean.contains("طماطم") -> R.drawable.img_product_tomato
+        clean.contains("lettuce") || clean.contains("خس") -> R.drawable.img_product_lettuce
+        clean.contains("carrot") || clean.contains("جزر") -> R.drawable.img_product_carrot
+        clean.contains("orange") || clean.contains("برتقال") -> R.drawable.img_product_orange
+        clean.contains("date") || clean.contains("تمر") -> R.drawable.img_product_dates
+        clean.contains("cucumber") || clean.contains("خيار") -> R.drawable.img_product_cucumber
+        clean.contains("mint") || clean.contains("نعناع") -> R.drawable.img_product_mint
+        clean.contains("avocado") || clean.contains("أفوكادو") || clean.contains("افوكادو") -> R.drawable.img_product_avocado
         else -> R.drawable.ic_produce_placeholder
     }
 }
@@ -44,32 +47,36 @@ fun resolveProduceDrawable(imageUrl: String?): Int {
 /**
  * Displays clean, professional product photography on a light neutral background
  * with consistent aspect ratio, smooth corner clipping, and a graceful fallback placeholder.
+ * Never blocks the UI thread and handles all error and empty states gracefully.
  */
 @Composable
 fun ProductVisual(
-    imageUrl: String,
+    imageUrl: String?,
     modifier: Modifier = Modifier,
     size: Dp = 100.dp,
+    backgroundColor: Color = Color(0xFFFAFCFA),
     contentDescription: String? = null
 ) {
     val context = LocalContext.current
-    val isRemoteUrl = imageUrl.startsWith("http://") || imageUrl.startsWith("https://")
-    val localResId = if (!isRemoteUrl) resolveProduceDrawable(imageUrl) else R.drawable.ic_produce_placeholder
-    val imageModel = if (isRemoteUrl) imageUrl else localResId
+    val cleanUrl = imageUrl?.trim().orEmpty()
+    val isRemoteUrl = cleanUrl.startsWith("http://", ignoreCase = true) || cleanUrl.startsWith("https://", ignoreCase = true)
+    val fallbackResId = resolveProduceDrawable(cleanUrl)
+    val imageModel: Any = if (isRemoteUrl) cleanUrl else fallbackResId
 
     Box(
         modifier = modifier
             .size(size)
             .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xFFFAFCFA)),
+            .background(backgroundColor),
         contentAlignment = Alignment.Center
     ) {
         AsyncImage(
             model = ImageRequest.Builder(context)
                 .data(imageModel)
                 .crossfade(true)
-                .placeholder(R.drawable.ic_produce_placeholder)
-                .error(R.drawable.ic_produce_placeholder)
+                .placeholder(fallbackResId)
+                .error(fallbackResId)
+                .fallback(fallbackResId)
                 .build(),
             contentDescription = contentDescription,
             contentScale = ContentScale.Fit,
