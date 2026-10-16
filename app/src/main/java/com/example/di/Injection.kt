@@ -5,6 +5,8 @@ import androidx.room.Room
 import com.example.data.local.AppDatabase
 import com.example.data.repository.CartRepository
 import com.example.data.repository.ProductRepository
+import com.example.data.api.FreshApiService
+import com.example.data.api.FreshRetrofitClient
 
 object Injection {
     private var database: AppDatabase? = null
@@ -19,10 +21,14 @@ object Injection {
     }
 
     fun provideProductRepository(context: Context): ProductRepository {
-        return ProductRepository(getDatabase(context).productDao())
+        return ProductRepository(getDatabase(context).productDao(), provideApiService())
     }
 
     fun provideCartRepository(context: Context): CartRepository {
         return CartRepository(getDatabase(context).cartDao())
+    }
+
+    fun provideApiService(): FreshApiService {
+        return FreshRetrofitClient.service
     }
 }

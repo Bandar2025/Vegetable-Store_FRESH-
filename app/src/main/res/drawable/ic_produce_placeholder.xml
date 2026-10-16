@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Soft circular neutral background -->
+    <path
+        android:fillColor="#F1F5F1"
+        android:pathData="M48,8 A40,40 0 1,0 48,88 A40,40 0 1,0 48,8 Z" />
+    <!-- Fresh green leaf placeholder icon -->
+    <path
+        android:fillColor="#16A34A"
+        android:pathData="M48,24 C58,24 68,34 68,48 C68,64 52,72 48,72 C44,72 28,64 28,48 C28,34 38,24 48,24 Z" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M48,32 L48,66 M48,42 C54,39 60,41 62,44 M48,52 C54,49 60,53 61,56 M48,45 C42,42 36,44 34,47 M48,55 C42,52 36,56 35,59" />
+</vector>

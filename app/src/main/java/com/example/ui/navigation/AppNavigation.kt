@@ -33,7 +33,15 @@ fun AppNavigation() {
             val viewModel: HomeViewModel = viewModel(
                 factory = HomeViewModelFactory(Injection.provideProductRepository(context))
             )
-            HomeScreen(viewModel, onProductClick = { navController.navigate(ProductDetail(it.id)) })
+            val cartVm: CartViewModel = viewModel(
+                factory = CartViewModelFactory(Injection.provideCartRepository(context), Injection.provideProductRepository(context))
+            )
+            HomeScreen(
+                viewModel = viewModel,
+                onProductClick = { navController.navigate(ProductDetail(it.id)) },
+                onCartClick = { navController.navigate(Cart) },
+                onAddToCart = { product -> cartVm.addToCart(product.id, 1) }
+            )
         }
         composable<ProductDetail> { backStackEntry ->
             val args = backStackEntry.toRoute<ProductDetail>()
