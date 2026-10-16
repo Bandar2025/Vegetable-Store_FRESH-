@@ -3,7 +3,7 @@ package com.example.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import com.example.data.repository.CartRepository
 import com.example.data.repository.ProductRepository
-import com.example.data.model.CartItem
+import com.example.data.local.model.CartItem
 import kotlinx.coroutines.flow.*
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.launch
@@ -25,7 +25,7 @@ class CartViewModel(
     }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
     val subtotal = cartItems.map { items ->
-        items.sumOf { (product, quantity) -> product.priceHalalas * quantity }
+        items.sumOf { (product, quantity) -> product.priceHalalas.toLong() * quantity.toLong() }
     }.stateIn(viewModelScope, SharingStarted.Lazily, 0L)
 
     val deliveryFee = 1500L // 15 SAR

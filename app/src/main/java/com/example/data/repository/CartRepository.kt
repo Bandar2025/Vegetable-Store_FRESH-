@@ -1,7 +1,7 @@
 package com.example.data.repository
 
-import com.example.data.local.CartDao
-import com.example.data.model.CartItem
+import com.example.data.local.dao.CartDao
+import com.example.data.local.model.CartItem
 import kotlinx.coroutines.flow.Flow
 
 class CartRepository(private val cartDao: CartDao) {

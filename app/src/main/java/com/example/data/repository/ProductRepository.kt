@@ -1,7 +1,7 @@
 package com.example.data.repository
 
-import com.example.data.local.ProductDao
-import com.example.data.model.Product
+import com.example.data.local.dao.ProductDao
+import com.example.data.local.model.Product
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 

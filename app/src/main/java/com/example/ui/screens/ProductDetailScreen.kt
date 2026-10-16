@@ -5,7 +5,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.example.data.model.Product
+import com.example.data.local.model.Product
 
 @Composable
 fun ProductDetailScreen(product: Product, onAddToCart: (Product) -> Unit, onBack: () -> Unit) {

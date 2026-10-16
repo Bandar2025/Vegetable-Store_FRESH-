@@ -4,7 +4,8 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.AppDatabase
-import com.example.data.model.CartItem
+import com.example.data.local.model.CartItem
+import com.example.data.local.model.Product
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -34,6 +35,8 @@ class CartDatabaseTest {
 
     @Test
     fun `add item to cart and read it back`() = runBlocking {
+        val product = Product(1, "تفاح", "فواكه", 500, "تفاح", "url", "kg")
+        db.productDao().insert(product)
         val cartItem = CartItem(productId = 1, quantity = 2)
         db.cartDao().insert(cartItem)
         val items = db.cartDao().getCartItems().first()
@@ -43,6 +46,8 @@ class CartDatabaseTest {
 
     @Test
     fun `update item quantity in cart`() = runBlocking {
+        val product = Product(1, "تفاح", "فواكه", 500, "تفاح", "url", "kg")
+        db.productDao().insert(product)
         val cartItem = CartItem(productId = 1, quantity = 2)
         db.cartDao().insert(cartItem)
         db.cartDao().insert(CartItem(productId = 1, quantity = 5))

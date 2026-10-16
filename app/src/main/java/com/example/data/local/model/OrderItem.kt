@@ -1,4 +1,4 @@
-package com.example.data.model
+package com.example.data.local.model
 
 import androidx.room.Entity
 import androidx.room.ForeignKey
@@ -26,5 +26,5 @@ data class OrderItem(
     val orderId: Int,
     val productId: Int,
     val quantity: Int,
-    val priceHalalas: Long
+    val priceHalalas: Int
 )

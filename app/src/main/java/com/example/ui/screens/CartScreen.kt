@@ -21,7 +21,7 @@ fun CartScreen(viewModel: CartViewModel, onCheckout: () -> Unit, onBack: () -> U
             items(cartItems) { (product, quantity) ->
                 Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text(text = "${product.name} x $quantity")
-                    Text(text = "${(product.priceHalalas * quantity) / 100} SAR")
+                    Text(text = "${(product.priceHalalas.toLong() * quantity) / 100} SAR")
                 }
             }
         }

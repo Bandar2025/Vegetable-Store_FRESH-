@@ -1,10 +1,10 @@
-package com.example.data.local
+package com.example.data.local.dao
 
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import com.example.data.model.CartItem
+import com.example.data.local.model.CartItem
 import kotlinx.coroutines.flow.Flow
 
 @Dao

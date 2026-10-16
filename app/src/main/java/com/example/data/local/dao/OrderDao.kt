@@ -1,9 +1,9 @@
-package com.example.data.local
+package com.example.data.local.dao
 
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.Query
-import com.example.data.model.Order
+import com.example.data.local.model.Order
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -12,5 +12,5 @@ interface OrderDao {
     fun getOrders(): Flow<List<Order>>
 
     @Insert
-    suspend fun insert(order: Order)
+    suspend fun insert(order: Order): Long
 }

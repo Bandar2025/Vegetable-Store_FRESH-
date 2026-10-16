@@ -1,4 +1,4 @@
-package com.example.data.model
+package com.example.data.local.model
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
@@ -10,7 +10,7 @@ data class Product(
     @PrimaryKey val id: Int,
     val name: String,
     val category: String,
-    val priceHalalas: Long,
+    val priceHalalas: Int,
     val description: String,
     val imageUrl: String,
     val unit: String

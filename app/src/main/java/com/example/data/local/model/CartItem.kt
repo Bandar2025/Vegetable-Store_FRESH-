@@ -1,8 +1,8 @@
-package com.example.data.model
+package com.example.data.local.model
+
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.PrimaryKey
-import com.example.data.model.Product
 
 @Entity(
     tableName = "cart_items",
