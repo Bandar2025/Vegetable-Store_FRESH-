@@ -9,8 +9,8 @@ class Category(models.Model):
 class Product(models.Model):
     name = models.CharField(max_length=200)
     category = models.ForeignKey(Category, on_delete=models.CASCADE)
-    # Using DecimalField for precision as requested
-    price = models.DecimalField(max_digits=10, decimal_places=2)
+    # Using BigIntegerField for halalas as requested to match DTO
+    price_halalas = models.BigIntegerField()
     description = models.TextField()
     image_url = models.CharField(max_length=500)
     unit = models.CharField(max_length=50)

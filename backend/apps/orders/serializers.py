@@ -5,14 +5,14 @@ from ..products.models import Product
 class OrderItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItem
-        fields = ['product', 'quantity', 'price_at_purchase']
+        fields = ['product', 'quantity', 'price_halalas']
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True)
 
     class Meta:
         model = Order
-        fields = ['id', 'items', 'total_amount', 'timestamp', 'status']
+        fields = ['id', 'items', 'total_halalas', 'timestamp', 'status']
 
     def create(self, validated_data):
         items_data = validated_data.pop('items')
