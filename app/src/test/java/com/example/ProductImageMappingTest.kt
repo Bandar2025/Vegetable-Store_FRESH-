@@ -96,4 +96,13 @@ class ProductImageMappingTest {
             assertTrue("Drawable resource ID must be valid positive int", it > 0)
         }
     }
+
+    @Test
+    fun testRemoteUrlMapping() {
+        // When a remote URL contains a known produce keyword, fallback resolves to that produce
+        assertEquals(R.drawable.img_product_apple, resolveProduceDrawable("https://example.com/fresh/apple.jpg"))
+        assertEquals(R.drawable.img_product_banana, resolveProduceDrawable("http://api.fresh-market.sa/media/banana.png"))
+        // When a remote URL has no known produce keyword, it resolves to placeholder
+        assertEquals(R.drawable.ic_produce_placeholder, resolveProduceDrawable("https://example.com/unknown/item123.jpg"))
+    }
 }

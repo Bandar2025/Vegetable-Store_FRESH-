@@ -10,6 +10,12 @@ import kotlinx.coroutines.flow.collectLatest
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.launch
 
+enum class ProductSortOrder(val title: String) {
+    POPULARITY("الأكثر شعبية"),
+    PRICE_LOW_TO_HIGH("السعر: الأقل أولاً"),
+    PRICE_HIGH_TO_LOW("السعر: الأعلى أولاً")
+}
+
 class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
 
     private val _products = MutableStateFlow<List<Product>>(emptyList())
@@ -23,6 +29,12 @@ class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
 
     private val _favoriteIds = MutableStateFlow<Set<Int>>(setOf(1, 3))
     val favoriteIds: StateFlow<Set<Int>> = _favoriteIds.asStateFlow()
+
+    private val _priceRange = MutableStateFlow(0f..30f)
+    val priceRange: StateFlow<ClosedFloatingPointRange<Float>> = _priceRange.asStateFlow()
+
+    private val _sortOrder = MutableStateFlow(ProductSortOrder.POPULARITY)
+    val sortOrder: StateFlow<ProductSortOrder> = _sortOrder.asStateFlow()
 
     init {
         loadProducts()
@@ -43,6 +55,18 @@ class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
 
     fun onCategorySelect(category: String) {
         _selectedCategory.value = category
+    }
+
+    fun onPriceRangeChange(range: ClosedFloatingPointRange<Float>) {
+        _priceRange.value = range
+    }
+
+    fun resetPriceRange() {
+        _priceRange.value = 0f..30f
+    }
+
+    fun onSortOrderChange(order: ProductSortOrder) {
+        _sortOrder.value = order
     }
 
     fun toggleFavorite(productId: Int) {
