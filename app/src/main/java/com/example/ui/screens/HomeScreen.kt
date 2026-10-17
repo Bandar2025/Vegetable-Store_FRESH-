@@ -30,7 +30,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.ui.text.input.ImeAction
 import com.example.ui.viewmodel.ProductSortOrder
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.ShoppingCart
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -63,7 +64,12 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.local.model.Product
+import com.example.ui.components.HomeShimmerSkeletonSection
+import com.example.ui.components.NutritionInfoBottomSheet
+import com.example.ui.components.ProTipsCardSection
+import com.example.ui.components.ProductCardSkeleton
 import com.example.ui.components.ProductVisual
+import com.example.ui.components.rememberShimmerBrush
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.HomeViewModel
 import kotlinx.coroutines.delay
@@ -76,9 +82,11 @@ fun HomeScreen(
     viewModel: HomeViewModel,
     onProductClick: (Product) -> Unit,
     onCartClick: () -> Unit = {},
-    onAddToCart: (Product) -> Unit = {}
+    onAddToCart: (Product) -> Unit = {},
+    onAccountClick: () -> Unit = {}
 ) {
     val products by viewModel.products.collectAsState()
+    val isLoading by viewModel.isLoading.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
     val selectedCategory by viewModel.selectedCategory.collectAsState()
     val favoriteIds by viewModel.favoriteIds.collectAsState()
@@ -88,37 +96,25 @@ fun HomeScreen(
     var isPriceFilterVisible by remember { mutableStateOf(false) }
     var selectedNavIndex by remember { mutableIntStateOf(0) }
     var recentlyAddedProductName by remember { mutableStateOf<String?>(null) }
+    var selectedProductForNutrition by remember { mutableStateOf<Product?>(null) }
     val scope = rememberCoroutineScope()
 
-    // Real-time filtering: when typing in search bar, selecting category (Fruits, Vegetables, Organic, etc.), and adjusting price range slider
+    // Real-time filtering: when typing in search bar and/or adjusting price range slider
     val filteredProducts = remember(products, searchQuery, selectedCategory, priceRange) {
         val q = searchQuery.trim()
         products.filter { product ->
             val productPriceSar = product.priceHalalas / 100f
             val matchesPrice = productPriceSar >= priceRange.start && productPriceSar <= priceRange.endInclusive
 
-            val matchesCategory = when (selectedCategory.lowercase(Locale.ROOT)) {
-                "الكل", "all" -> true
-                "فواكه", "fruits", "fruit" -> product.category.contains("فواكه", ignoreCase = true)
-                "خضروات", "vegetables", "veg" -> product.category.contains("خضروات", ignoreCase = true)
-                "عضوي", "organic" -> product.name.contains("عضوي", ignoreCase = true) ||
-                                   product.description.contains("عضوي", ignoreCase = true) ||
-                                   product.category.contains("عضوي", ignoreCase = true)
-                "ورقيات", "greens", "leafy" -> product.category.contains("ورقيات", ignoreCase = true)
-                "تمور", "dates" -> product.category.contains("تمور", ignoreCase = true)
-                else -> product.category.contains(selectedCategory, ignoreCase = true) ||
-                        product.name.contains(selectedCategory, ignoreCase = true)
-            }
-
-            val matchesSearch = if (q.isNotBlank()) {
+            val matchesSearchOrCategory = if (q.isNotBlank()) {
                 product.name.contains(q, ignoreCase = true) ||
                 product.category.contains(q, ignoreCase = true) ||
                 product.description.contains(q, ignoreCase = true)
             } else {
-                true
+                selectedCategory == "الكل" || product.category.contains(selectedCategory)
             }
 
-            matchesPrice && matchesCategory && matchesSearch
+            matchesPrice && matchesSearchOrCategory
         }
     }
 
@@ -131,6 +127,10 @@ fun HomeScreen(
         }
     }
 
+    val productPairs = remember(sortedProducts) {
+        sortedProducts.chunked(2)
+    }
+
     // Force RTL layout for Saudi market and Arabic language
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Scaffold(
@@ -140,9 +140,10 @@ fun HomeScreen(
                 FreshBottomNavigationBar(
                     selectedIndex = selectedNavIndex,
                     onItemSelected = { index ->
-                        selectedNavIndex = index
-                        if (index == 3) {
-                            onCartClick()
+                        when (index) {
+                            3 -> onCartClick()
+                            4 -> onAccountClick()
+                            else -> selectedNavIndex = index
                         }
                     }
                 )
@@ -154,11 +155,13 @@ fun HomeScreen(
                     .padding(paddingValues)
             ) {
                 LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("home_lazy_column"),
                     contentPadding = PaddingValues(bottom = 24.dp)
                 ) {
                     // 1. Top Header with Location, Brand & Actions
-                    item {
+                    item(key = "home_top_bar") {
                         HomeTopBar(
                             onCartClick = onCartClick,
                             onNotificationClick = {}
@@ -166,7 +169,7 @@ fun HomeScreen(
                     }
 
                     // 2. Search Section: Real-time Search Bar & Range Slider Price Filter
-                    item {
+                    item(key = "home_search_section") {
                         Column(modifier = Modifier.fillMaxWidth()) {
                             HomeSearchBar(
                                 query = searchQuery,
@@ -189,123 +192,175 @@ fun HomeScreen(
                         }
                     }
 
-                    if (searchQuery.isBlank()) {
-                        // 3. Horizontal Scrolling Promotional Banner Section
-                        item {
-                            HomePromoBannerSection(
-                                onBannerClick = { categoryTarget ->
-                                    viewModel.onCategorySelect(categoryTarget)
-                                }
-                            )
+                    // Shimmer-based Skeleton Loading State while initial product data is being fetched
+                    if (isLoading && products.isEmpty()) {
+                        item(key = "home_shimmer_skeleton_section") {
+                            HomeShimmerSkeletonSection()
                         }
-
-                        // 4. Category Filter Chips
-                        item {
-                            HomeCategorySection(
-                                selectedCategory = selectedCategory,
-                                onCategorySelected = { viewModel.onCategorySelect(it) }
-                            )
-                        }
-
-                        // 5. Section Header with Sort Dropdown Menu
-                        item {
-                            val sectionTitle = when (selectedCategory) {
-                                "الكل" -> "عروض اليوم الطازجة"
-                                "فواكه" -> "فواكه طازجة • Fresh Fruits"
-                                "خضروات" -> "خضروات طازجة • Fresh Vegetables"
-                                "عضوي" -> "منتجات عضوية • Organic Produce"
-                                "ورقيات" -> "ورقيات وأعشاب • Leafy Greens"
-                                "تمور" -> "تمور فاخرة • Premium Dates"
-                                else -> "منتجات $selectedCategory"
+                    } else {
+                        if (searchQuery.isBlank()) {
+                            // 3. Horizontal Scrolling Promotional Banner Section
+                            item(key = "home_promo_banner_section") {
+                                HomePromoBannerSection(
+                                    onBannerClick = { categoryTarget ->
+                                        viewModel.onCategorySelect(categoryTarget)
+                                    }
+                                )
                             }
-                            HomeSectionHeader(
-                                title = sectionTitle,
-                                badgeText = if (selectedCategory == "الكل") "خصومات حصرية" else "${sortedProducts.size} منتجات",
-                                sortOrder = sortOrder,
-                                onSortOrderChange = { viewModel.onSortOrderChange(it) },
-                                onSeeAllClick = {
-                                    viewModel.onCategorySelect("الكل")
-                                }
-                            )
+
+                            // 4. Category Filter Chips
+                            item(key = "home_category_section") {
+                                HomeCategorySection(
+                                    selectedCategory = selectedCategory,
+                                    onCategorySelected = { viewModel.onCategorySelect(it) }
+                                )
+                            }
+
+                            // 5. Seasonal Produce Storage 'Pro Tips' Card Component
+                            item(key = "home_pro_tips_section") {
+                                ProTipsCardSection(
+                                    onCategorySelect = { categoryTarget ->
+                                        viewModel.onCategorySelect(categoryTarget)
+                                    }
+                                )
+                            }
+
+                            // 6. Section Header with Sort Dropdown Menu
+                            item(key = "home_section_header") {
+                                HomeSectionHeader(
+                                    title = if (selectedCategory == "الكل") "عروض اليوم الطازجة" else "منتجات $selectedCategory",
+                                    badgeText = if (selectedCategory == "الكل") "خصومات حصرية" else "${sortedProducts.size} منتجات",
+                                    sortOrder = sortOrder,
+                                    onSortOrderChange = { viewModel.onSortOrderChange(it) },
+                                    onSeeAllClick = {
+                                        viewModel.onCategorySelect("الكل")
+                                    }
+                                )
+                            }
+
+                            // Quick Sort Toggle Buttons Row
+                            item(key = "home_sort_toggle_row") {
+                                ProductSortToggleRow(
+                                    sortOrder = sortOrder,
+                                    onSortOrderChange = { viewModel.onSortOrderChange(it) }
+                                )
+                            }
+                        } else {
+                            // Real-time search results header with Sort Options
+                            item(key = "search_results_header") {
+                                HomeSectionHeader(
+                                    title = "نتائج البحث",
+                                    badgeText = "${sortedProducts.size} منتج",
+                                    sortOrder = sortOrder,
+                                    onSortOrderChange = { viewModel.onSortOrderChange(it) },
+                                    onSeeAllClick = {
+                                        viewModel.onSearchQueryChange("")
+                                    }
+                                )
+                            }
+
+                            // Quick Sort Toggle Buttons Row
+                            item(key = "search_sort_toggle_row") {
+                                ProductSortToggleRow(
+                                    sortOrder = sortOrder,
+                                    onSortOrderChange = { viewModel.onSortOrderChange(it) }
+                                )
+                            }
                         }
 
-                        // Quick Sort Toggle Buttons Row
-                        item {
-                            ProductSortToggleRow(
-                                sortOrder = sortOrder,
-                                onSortOrderChange = { viewModel.onSortOrderChange(it) }
-                            )
-                        }
-                    } else {
-                        // Real-time search results header with Sort Options
-                        item {
-                            HomeSectionHeader(
-                                title = "نتائج البحث",
-                                badgeText = "${sortedProducts.size} منتج",
-                                sortOrder = sortOrder,
-                                onSortOrderChange = { viewModel.onSortOrderChange(it) },
-                                onSeeAllClick = {
-                                    viewModel.onSearchQueryChange("")
-                                }
-                            )
-                        }
-
-                        // Quick Sort Toggle Buttons Row
-                        item {
-                            ProductSortToggleRow(
-                                sortOrder = sortOrder,
-                                onSortOrderChange = { viewModel.onSortOrderChange(it) }
-                            )
-                        }
-                    }
-
-                    // 6. Products Grid (Rendered in pairs for smooth single-scroll experience)
-                    if (sortedProducts.isEmpty()) {
-                        item {
-                            EmptyProductsState(
-                                searchQuery = searchQuery,
-                                onResetClick = {
-                                    viewModel.onSearchQueryChange("")
-                                    viewModel.onCategorySelect("الكل")
-                                    viewModel.resetPriceRange()
-                                }
-                            )
-                        }
-                    } else {
-                        val productPairs = sortedProducts.chunked(2)
-                        items(productPairs) { pair ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        // 7. Products Grid (Rendered in pairs for smooth single-scroll experience, or skeleton cards while refreshing)
+                        if (isLoading) {
+                            items(
+                                count = 3,
+                                key = { "product_skeleton_row_$it" },
+                                contentType = { "product_skeleton_row" }
                             ) {
-                                for (product in pair) {
+                                val rowShimmerBrush = rememberShimmerBrush()
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
                                     Box(modifier = Modifier.weight(1f)) {
-                                        ProductCard(
-                                            product = product,
-                                            isFavorite = favoriteIds.contains(product.id),
-                                            onFavoriteClick = { viewModel.toggleFavorite(product.id) },
-                                            onClick = { onProductClick(product) },
-                                            onAddToCart = {
-                                                onAddToCart(product)
-                                                recentlyAddedProductName = product.name
-                                                scope.launch {
-                                                    delay(2000)
-                                                    if (recentlyAddedProductName == product.name) {
-                                                        recentlyAddedProductName = null
-                                                    }
-                                                }
-                                            }
-                                        )
+                                        ProductCardSkeleton(shimmerBrush = rowShimmerBrush)
+                                    }
+                                    Box(modifier = Modifier.weight(1f)) {
+                                        ProductCardSkeleton(shimmerBrush = rowShimmerBrush)
                                     }
                                 }
-                                if (pair.size == 1) {
-                                    Spacer(modifier = Modifier.weight(1f))
+                            }
+                        } else if (sortedProducts.isEmpty()) {
+                            item(key = "empty_products_state") {
+                                EmptyProductsState(
+                                    searchQuery = searchQuery,
+                                    onResetClick = {
+                                        viewModel.onSearchQueryChange("")
+                                        viewModel.onCategorySelect("الكل")
+                                        viewModel.resetPriceRange()
+                                    }
+                                )
+                            }
+                        } else {
+                            items(
+                                items = productPairs,
+                                key = { pair -> "${pair.first().id}_${pair.getOrNull(1)?.id ?: "single"}" },
+                                contentType = { "product_pair_row" }
+                            ) { pair ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    for (product in pair) {
+                                        Box(modifier = Modifier.weight(1f)) {
+                                            key(product.id) {
+                                                ProductCard(
+                                                    product = product,
+                                                    isFavorite = favoriteIds.contains(product.id),
+                                                    onFavoriteClick = { viewModel.toggleFavorite(product.id) },
+                                                    onNutritionClick = { selectedProductForNutrition = product },
+                                                    onClick = { onProductClick(product) },
+                                                    onAddToCart = {
+                                                        onAddToCart(product)
+                                                        recentlyAddedProductName = product.name
+                                                        scope.launch {
+                                                            delay(2000)
+                                                            if (recentlyAddedProductName == product.name) {
+                                                                recentlyAddedProductName = null
+                                                            }
+                                                        }
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+                                    if (pair.size == 1) {
+                                        Spacer(modifier = Modifier.weight(1f))
+                                    }
                                 }
                             }
                         }
                     }
+                }
+
+                // Nutrition Info Bottom Sheet for selected produce item
+                selectedProductForNutrition?.let { nutritionProduct ->
+                    NutritionInfoBottomSheet(
+                        product = nutritionProduct,
+                        onDismiss = { selectedProductForNutrition = null },
+                        onAddToCart = { addedProduct ->
+                            onAddToCart(addedProduct)
+                            recentlyAddedProductName = addedProduct.name
+                            scope.launch {
+                                delay(2000)
+                                if (recentlyAddedProductName == addedProduct.name) {
+                                    recentlyAddedProductName = null
+                                }
+                            }
+                        }
+                    )
                 }
 
                 // Temporary Add-To-Cart Feedback Floating Pill
@@ -889,18 +944,8 @@ private fun HomePromoBannerCard(
 }
 
 /**
- * 4. Horizontal Scrolling Category Navigation Bar
- * Allows users to filter the product feed by categories like 'Fruits', 'Vegetables', and 'Organic'.
+ * 4. Attractive Category Icons and Arabic Labels
  */
-private data class CategoryNavItem(
-    val key: String,
-    val nameAr: String,
-    val nameEn: String,
-    val sampleImageKey: String,
-    val isOrganic: Boolean = false,
-    val badge: String? = null
-)
-
 @Composable
 private fun HomeCategorySection(
     selectedCategory: String,
@@ -908,252 +953,69 @@ private fun HomeCategorySection(
 ) {
     val categories = remember {
         listOf(
-            CategoryNavItem(
-                key = "الكل",
-                nameAr = "الكل",
-                nameEn = "All",
-                sampleImageKey = "apple"
-            ),
-            CategoryNavItem(
-                key = "فواكه",
-                nameAr = "فواكه",
-                nameEn = "Fruits",
-                sampleImageKey = "orange",
-                badge = "طازجة"
-            ),
-            CategoryNavItem(
-                key = "خضروات",
-                nameAr = "خضروات",
-                nameEn = "Vegetables",
-                sampleImageKey = "tomato",
-                badge = "محلية"
-            ),
-            CategoryNavItem(
-                key = "عضوي",
-                nameAr = "عضوي",
-                nameEn = "Organic",
-                sampleImageKey = "lettuce",
-                isOrganic = true,
-                badge = "عضوي 🌱"
-            ),
-            CategoryNavItem(
-                key = "ورقيات",
-                nameAr = "ورقيات",
-                nameEn = "Greens",
-                sampleImageKey = "mint",
-                badge = "يومي"
-            ),
-            CategoryNavItem(
-                key = "تمور",
-                nameAr = "تمور",
-                nameEn = "Dates",
-                sampleImageKey = "dates",
-                badge = "فاخر ✨"
-            )
+            "الكل" to "apple",
+            "خضروات" to "tomato",
+            "فواكه" to "orange",
+            "ورقيات" to "lettuce",
+            "تمور" to "dates"
         )
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp)
-    ) {
-        // Section Header Row with Category Title and Clear Action
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "الأقسام",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = TextDarkGreen
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "• Categories",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
-                )
-            }
-
-            if (selectedCategory != "الكل") {
-                Surface(
-                    onClick = { onCategorySelected("الكل") },
-                    shape = RoundedCornerShape(8.dp),
-                    color = FreshGreenLight,
-                    modifier = Modifier.clip(RoundedCornerShape(8.dp))
-                ) {
-                    Text(
-                        text = "عرض الكل",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = FreshGreen,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(4.dp))
-
-        // Horizontal Scrolling Category Navigation Bar
+    Column(modifier = Modifier.padding(vertical = 10.dp)) {
         LazyRow(
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("category_navigation_bar"),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            contentPadding = PaddingValues(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(categories, key = { it.key }) { category ->
-                val isSelected = selectedCategory == category.key
-                CategoryNavCard(
-                    category = category,
-                    isSelected = isSelected,
-                    onClick = {
-                        if (isSelected && category.key != "الكل") {
-                            onCategorySelected("الكل")
-                        } else {
-                            onCategorySelected(category.key)
-                        }
-                    }
+            items(categories, key = { it.first }) { (categoryName, sampleKey) ->
+                val isSelected = selectedCategory == categoryName
+                val bgColor by animateColorAsState(
+                    targetValue = if (isSelected) ActionGreen else CardSurface,
+                    animationSpec = spring(),
+                    label = "categoryBg"
                 )
-            }
-        }
-    }
-}
+                val textColor by animateColorAsState(
+                    targetValue = if (isSelected) White else TextDarkGreen,
+                    label = "categoryText"
+                )
 
-@Composable
-private fun CategoryNavCard(
-    category: CategoryNavItem,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
-    val bgColor by animateColorAsState(
-        targetValue = if (isSelected) Color(0xFFE8F5E9) else CardSurface,
-        animationSpec = spring(),
-        label = "catBg"
-    )
-    val borderColor by animateColorAsState(
-        targetValue = if (isSelected) ActionGreen else BorderSubtle,
-        animationSpec = spring(),
-        label = "catBorder"
-    )
-
-    Surface(
-        onClick = onClick,
-        modifier = Modifier
-            .width(86.dp)
-            .height(112.dp)
-            .testTag("category_chip_${category.key}"),
-        shape = RoundedCornerShape(18.dp),
-        color = bgColor,
-        border = androidx.compose.foundation.BorderStroke(
-            width = if (isSelected) 2.dp else 1.dp,
-            color = borderColor
-        ),
-        shadowElevation = if (isSelected) 3.dp else 1.dp
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(vertical = 8.dp, horizontal = 4.dp)
-        ) {
-            // Optional Badge on Top (e.g. Organic indicator)
-            if (category.isOrganic) {
-                Surface(
-                    color = ActionGreen,
-                    shape = RoundedCornerShape(6.dp),
-                    modifier = Modifier.align(Alignment.TopEnd)
-                ) {
-                    Text(
-                        text = "عضوي",
-                        color = White,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontSize = 8.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                    )
-                }
-            } else if (category.badge != null && isSelected) {
-                Surface(
-                    color = FreshGreenLight,
-                    shape = RoundedCornerShape(6.dp),
-                    modifier = Modifier.align(Alignment.TopEnd)
-                ) {
-                    Text(
-                        text = category.badge,
-                        color = FreshGreen,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontSize = 8.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                    )
-                }
-            }
-
-            Column(
-                modifier = Modifier.fillMaxSize(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-                // Circular Image Container
-                Box(
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (isSelected) ActionGreen.copy(alpha = 0.16f) else Color(0xFFF3F5F3)
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    ProductVisual(
-                        imageUrl = category.sampleImageKey,
-                        size = 32.dp,
-                        backgroundColor = Color.Transparent,
-                        contentDescription = "${category.nameAr} ${category.nameEn}"
-                    )
-                }
-
-                // Bilingual Typography: Arabic Name + English Category Label
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .clickable { onCategorySelected(categoryName) }
+                        .padding(4.dp)
                 ) {
-                    Text(
-                        text = category.nameAr,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                        color = if (isSelected) FreshGreenDark else TextDarkGreen,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = category.nameEn,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontSize = 11.sp,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isSelected) ActionGreen else TextSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                // Selection Pill Indicator at Bottom
-                if (isSelected) {
                     Box(
                         modifier = Modifier
-                            .width(18.dp)
-                            .height(3.dp)
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(ActionGreen)
+                            .size(60.dp)
+                            .shadow(
+                                elevation = if (isSelected) 4.dp else 1.dp,
+                                shape = RoundedCornerShape(18.dp),
+                                ambientColor = ActionGreen.copy(alpha = 0.2f)
+                            )
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(bgColor)
+                            .border(
+                                width = 1.dp,
+                                color = if (isSelected) ActionGreen else BorderSubtle,
+                                shape = RoundedCornerShape(18.dp)
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        ProductVisual(
+                            imageUrl = sampleKey,
+                            size = 38.dp,
+                            backgroundColor = Color.Transparent,
+                            contentDescription = categoryName
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = categoryName,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                        color = textColor
                     )
-                } else {
-                    Spacer(modifier = Modifier.height(3.dp))
                 }
             }
         }
@@ -1231,7 +1093,7 @@ private fun HomeSectionHeader(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Sort,
+                            imageVector = Icons.AutoMirrored.Filled.Sort,
                             contentDescription = "ترتيب المنتجات",
                             tint = FreshGreen,
                             modifier = Modifier.size(16.dp)
@@ -1303,7 +1165,7 @@ private fun ProductSortToggleRow(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        items(ProductSortOrder.values()) { order ->
+        items(ProductSortOrder.values(), key = { it.name }) { order ->
             val isSelected = sortOrder == order
             Surface(
                 onClick = { onSortOrderChange(order) },
@@ -1352,7 +1214,8 @@ fun ProductCard(
     isFavorite: Boolean,
     onFavoriteClick: () -> Unit,
     onClick: () -> Unit,
-    onAddToCart: () -> Unit
+    onAddToCart: () -> Unit,
+    onNutritionClick: () -> Unit = {}
 ) {
     var isAddPressed by remember { mutableStateOf(false) }
     val buttonScope = rememberCoroutineScope()
@@ -1407,7 +1270,7 @@ fun ProductCard(
                 .fillMaxWidth()
                 .padding(12.dp)
         ) {
-            // Card Top Row: Category tag and Favorite Heart
+            // Card Top Row: Category tag, Nutrition Info button, and Favorite Heart
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1426,41 +1289,71 @@ fun ProductCard(
                     )
                 }
 
-                // Heart-shaped favorites toggle button with scale animation and active color shift
-                val heartScale by animateFloatAsState(
-                    targetValue = if (isFavorite) 1.18f else 1f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                        stiffness = Spring.StiffnessMedium
-                    ),
-                    label = "heartScale"
-                )
-
-                IconButton(
-                    onClick = onFavoriteClick,
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .background(if (isFavorite) Color(0xFFFFEEF0) else Color(0xFFF8FAF7))
-                        .border(
-                            width = 1.dp,
-                            color = if (isFavorite) Color(0xFFFFCDD2) else BorderSubtle,
-                            shape = CircleShape
-                        )
-                        .graphicsLayer {
-                            scaleX = heartScale
-                            scaleY = heartScale
-                        }
-                        .semantics {
-                            contentDescription = if (isFavorite) "إزالة ${product.name} من المفضلة" else "إضافة ${product.name} إلى المفضلة"
-                        }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(
-                        imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                        contentDescription = null,
-                        tint = if (isFavorite) FavoriteRed else TextSecondary,
-                        modifier = Modifier.size(20.dp)
+                    // Small 'Nutrition Info' icon button to open caloric & vitamin details bottom sheet
+                    IconButton(
+                        onClick = onNutritionClick,
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .background(FreshGreenLight.copy(alpha = 0.7f))
+                            .border(
+                                width = 1.dp,
+                                color = BorderSubtle,
+                                shape = CircleShape
+                            )
+                            .testTag("nutrition_info_button_${product.id}")
+                            .semantics {
+                                contentDescription = "المعلومات الغذائية لـ ${product.name}"
+                            }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Info,
+                            contentDescription = null,
+                            tint = FreshGreen,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+
+                    // Heart-shaped favorites toggle button with scale animation and active color shift
+                    val heartScale by animateFloatAsState(
+                        targetValue = if (isFavorite) 1.18f else 1f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                            stiffness = Spring.StiffnessMedium
+                        ),
+                        label = "heartScale"
                     )
+
+                    IconButton(
+                        onClick = onFavoriteClick,
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(if (isFavorite) Color(0xFFFFEEF0) else Color(0xFFF8FAF7))
+                            .border(
+                                width = 1.dp,
+                                color = if (isFavorite) Color(0xFFFFCDD2) else BorderSubtle,
+                                shape = CircleShape
+                            )
+                            .graphicsLayer {
+                                scaleX = heartScale
+                                scaleY = heartScale
+                            }
+                            .semantics {
+                                contentDescription = if (isFavorite) "إزالة ${product.name} من المفضلة" else "إضافة ${product.name} إلى المفضلة"
+                            }
+                    ) {
+                        Icon(
+                            imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            contentDescription = null,
+                            tint = if (isFavorite) FavoriteRed else TextSecondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
 

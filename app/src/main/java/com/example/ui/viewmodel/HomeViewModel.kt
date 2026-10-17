@@ -21,6 +21,9 @@ class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
     private val _products = MutableStateFlow<List<Product>>(emptyList())
     val products: StateFlow<List<Product>> = _products.asStateFlow()
 
+    private val _isLoading = MutableStateFlow(true)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
@@ -42,11 +45,25 @@ class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
 
     private fun loadProducts() {
         viewModelScope.launch {
+            _isLoading.value = true
             repository.ensureInitialData()
-            repository.getAllProducts().collectLatest {
-                _products.value = it
+            repository.getAllProducts().collectLatest { items ->
+                _products.value = items
+                _isLoading.value = false
             }
         }
+    }
+
+    fun refreshProducts() {
+        viewModelScope.launch {
+            _isLoading.value = true
+            repository.refreshProducts()
+            _isLoading.value = false
+        }
+    }
+
+    fun setLoadingState(loading: Boolean) {
+        _isLoading.value = loading
     }
 
     fun onSearchQueryChange(query: String) {

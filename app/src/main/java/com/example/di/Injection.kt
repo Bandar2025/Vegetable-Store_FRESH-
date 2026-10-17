@@ -2,6 +2,7 @@ package com.example.di
 
 import android.content.Context
 import androidx.room.Room
+import com.example.data.auth.LocalAuthRepository
 import com.example.data.local.AppDatabase
 import com.example.data.repository.CartRepository
 import com.example.data.repository.ProductRepository
@@ -26,6 +27,10 @@ object Injection {
 
     fun provideCartRepository(context: Context): CartRepository {
         return CartRepository(getDatabase(context).cartDao())
+    }
+
+    fun provideAuthRepository(context: Context): LocalAuthRepository {
+        return LocalAuthRepository.getInstance(context)
     }
 
     fun provideApiService(): FreshApiService {
