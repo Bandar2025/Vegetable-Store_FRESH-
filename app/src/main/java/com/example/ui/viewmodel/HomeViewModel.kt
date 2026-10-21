@@ -48,7 +48,15 @@ class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
             _isLoading.value = true
             repository.ensureInitialData()
             repository.getAllProducts().collectLatest { items ->
-                _products.value = items
+                // Only display active, non-archived products in the customer storefront
+                val activeStorefrontItems = items.filter { it.isVisibleInStorefront }
+                _products.value = activeStorefrontItems
+                // Keep price range ceiling wide enough for newly added higher-priced products
+                val maxPriceSar = activeStorefrontItems.maxOfOrNull { it.priceSar.toFloat() } ?: 30f
+                val targetCeiling = maxOf(30f, maxPriceSar)
+                if (_priceRange.value.start == 0f && _priceRange.value.endInclusive == 30f && targetCeiling > 30f) {
+                    _priceRange.value = 0f..targetCeiling
+                }
                 _isLoading.value = false
             }
         }
@@ -79,7 +87,8 @@ class HomeViewModel(private val repository: ProductRepository) : ViewModel() {
     }
 
     fun resetPriceRange() {
-        _priceRange.value = 0f..30f
+        val maxPriceSar = _products.value.maxOfOrNull { it.priceSar.toFloat() } ?: 30f
+        _priceRange.value = 0f..maxOf(30f, maxPriceSar)
     }
 
     fun onSortOrderChange(order: ProductSortOrder) {

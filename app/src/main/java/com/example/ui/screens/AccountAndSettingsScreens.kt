@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.ShoppingBag
@@ -83,7 +84,8 @@ fun AccountProfileScreen(
     onNavigateToSettings: () -> Unit,
     onNavigateToStoreManagement: () -> Unit,
     onBackToShopping: () -> Unit,
-    onLoggedOut: () -> Unit
+    onLoggedOut: () -> Unit,
+    onNavigateToOrderHistory: () -> Unit = {}
 ) {
     val currentUser by viewModel.currentUser.collectAsState()
     val showLogoutDialog by viewModel.showLogoutConfirmation.collectAsState()
@@ -338,6 +340,22 @@ fun AccountProfileScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
+                        OutlinedButton(
+                            onClick = onNavigateToOrderHistory,
+                            border = BorderStroke(1.dp, BorderSubtle),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("profile_order_history_button")
+                        ) {
+                            Icon(Icons.Default.ReceiptLong, contentDescription = null, tint = FreshGreen)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("سجل طلباتي المحلية", color = TextDarkGreen, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
                         OutlinedButton(
                             onClick = onNavigateToSettings,
                             border = BorderStroke(1.dp, BorderSubtle),
@@ -777,259 +795,17 @@ fun StoreOwnerFoundationScreen(
     onNavigateToAccount: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToLogin: () -> Unit,
-    onLoggedOut: () -> Unit
+    onLoggedOut: () -> Unit,
+    storeViewModel: com.example.ui.viewmodel.StoreManagementViewModel? = null
 ) {
-    val currentUser by viewModel.currentUser.collectAsState()
-    val showLogoutDialog by viewModel.showLogoutConfirmation.collectAsState()
-
-    val accessDecision = AccessControlPolicy.checkAccess(
-        user = currentUser,
-        requiresAuth = true,
-        requiresStoreManagement = true
+    StoreOwnerPortalScreen(
+        authViewModel = viewModel,
+        storeViewModel = storeViewModel,
+        onSwitchToCustomerStorefront = onSwitchToCustomerStorefront,
+        onNavigateToAccount = onNavigateToAccount,
+        onNavigateToSettings = onNavigateToSettings,
+        onNavigateToLogin = onNavigateToLogin,
+        onLoggedOut = onLoggedOut
     )
-
-    if (showLogoutDialog) {
-        LogoutConfirmationDialog(
-            user = currentUser,
-            onConfirmLogout = {
-                viewModel.confirmLogout(onLoggedOut = onLoggedOut)
-            },
-            onDismiss = { viewModel.dismissLogoutConfirmation() }
-        )
-    }
-
-    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-        Scaffold(
-            containerColor = FreshBackground,
-            contentWindowInsets = WindowInsets.statusBars
-        ) { paddingValues ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(paddingValues)
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 16.dp)
-                    .testTag("store_owner_foundation_screen")
-            ) {
-                if (accessDecision is AccessControlDecision.Denied) {
-                    // Unauthorized Access Guard UI
-                    Surface(
-                        shape = RoundedCornerShape(18.dp),
-                        color = Color(0xFFFEF2F2),
-                        border = BorderStroke(1.dp, AccentRed),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("store_management_unauthorized_card")
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(20.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Lock,
-                                contentDescription = null,
-                                tint = AccentRed,
-                                modifier = Modifier.size(44.dp)
-                            )
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text(
-                                text = "غير مصرح بالوصول إلى إدارة المتجر",
-                                style = MaterialTheme.typography.titleLarge,
-                                color = TextDarkGreen,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = accessDecision.reasonArabic,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TextSecondary
-                            )
-                            Spacer(modifier = Modifier.height(18.dp))
-                            Button(
-                                onClick = onSwitchToCustomerStorefront,
-                                colors = ButtonDefaults.buttonColors(containerColor = FreshGreen),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("unauthorized_return_home_button")
-                            ) {
-                                Text("العودة إلى متجر التسوق (العميل)", color = White, fontWeight = FontWeight.Bold)
-                            }
-                            if (currentUser == null) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedButton(
-                                    onClick = onNavigateToLogin,
-                                    border = BorderStroke(1.dp, FreshGreen),
-                                    shape = RoundedCornerShape(14.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("unauthorized_login_button")
-                                ) {
-                                    Text("تسجيل الدخول", color = FreshGreen, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    val user = currentUser!!
-                    // Authorized Store Owner / Admin Entry Header
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = FreshGreenDark,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("store_management_authorized_header")
-                    ) {
-                        Column(modifier = Modifier.padding(20.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = if (user.role == com.example.data.auth.UserRole.STORE_OWNER) {
-                                            Icons.Default.Storefront
-                                        } else {
-                                            Icons.Default.AdminPanelSettings
-                                        },
-                                        contentDescription = null,
-                                        tint = ActionGreen,
-                                        modifier = Modifier.size(28.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Text(
-                                        text = "بوابة إدارة متجر فريش",
-                                        style = MaterialTheme.typography.titleLarge,
-                                        color = White,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-
-                                Surface(
-                                    color = AccentOrange,
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Text(
-                                        text = user.role.arabicTitle,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = White,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier
-                                            .padding(horizontal = 10.dp, vertical = 4.dp)
-                                            .testTag("store_owner_role_badge")
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(
-                                text = "مرحباً ${user.fullName} (${user.email})",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = White.copy(alpha = 0.9f)
-                            )
-                            if (user.isLocalDemoAccount) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text = "⚠️ جلسة تطوير محلية تجريبية (Local Dev / Demo Session Only)",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = AccentOrange,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Foundation Status Card (Micro Task 5A -> 5B)
-                    Surface(
-                        shape = RoundedCornerShape(18.dp),
-                        color = CardSurface,
-                        border = BorderStroke(1.dp, BorderSubtle),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(18.dp)) {
-                            Text(
-                                text = "نقطة الدخول التأسيسية لإدارة المتجر",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = TextDarkGreen,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = "تم التحقق من صلاحية الدور (${user.role.arabicTitle}) وتوجيهك تلقائياً إلى بيئة إدارة المتجر. ستُستكمل أدوات لوحة التحكم الكاملة وإدارة المنتجات والمخزون في المهمة القادمة (Micro Task 5B).",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TextSecondary
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Quick Actions for Store Owner / Admin
-                    Button(
-                        onClick = onSwitchToCustomerStorefront,
-                        colors = ButtonDefaults.buttonColors(containerColor = FreshGreen),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp)
-                            .testTag("owner_preview_storefront_button")
-                    ) {
-                        Icon(Icons.Default.ShoppingBag, contentDescription = null, tint = White)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("معاينة واجهة التسوق (متجر العملاء)", color = White, fontWeight = FontWeight.Bold)
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = onNavigateToAccount,
-                            border = BorderStroke(1.dp, FreshGreen),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp)
-                                .testTag("owner_account_button")
-                        ) {
-                            Text("الملف الشخصي", color = FreshGreen, fontWeight = FontWeight.Bold)
-                        }
-
-                        OutlinedButton(
-                            onClick = onNavigateToSettings,
-                            border = BorderStroke(1.dp, FreshGreen),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp)
-                                .testTag("owner_settings_button")
-                        ) {
-                            Text("الإعدادات", color = FreshGreen, fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    OutlinedButton(
-                        onClick = { viewModel.requestLogoutConfirmation() },
-                        border = BorderStroke(1.dp, AccentRed),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .testTag("owner_logout_button")
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.ExitToApp, contentDescription = null, tint = AccentRed)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("تسجيل الخروج", color = AccentRed, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-    }
 }
+

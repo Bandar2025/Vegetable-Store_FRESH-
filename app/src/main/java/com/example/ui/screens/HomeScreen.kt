@@ -323,12 +323,14 @@ fun HomeScreen(
                                                     onNutritionClick = { selectedProductForNutrition = product },
                                                     onClick = { onProductClick(product) },
                                                     onAddToCart = {
-                                                        onAddToCart(product)
-                                                        recentlyAddedProductName = product.name
-                                                        scope.launch {
-                                                            delay(2000)
-                                                            if (recentlyAddedProductName == product.name) {
-                                                                recentlyAddedProductName = null
+                                                        if (!product.isOutOfStock) {
+                                                            onAddToCart(product)
+                                                            recentlyAddedProductName = product.name
+                                                            scope.launch {
+                                                                delay(2000)
+                                                                if (recentlyAddedProductName == product.name) {
+                                                                    recentlyAddedProductName = null
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -351,12 +353,14 @@ fun HomeScreen(
                         product = nutritionProduct,
                         onDismiss = { selectedProductForNutrition = null },
                         onAddToCart = { addedProduct ->
-                            onAddToCart(addedProduct)
-                            recentlyAddedProductName = addedProduct.name
-                            scope.launch {
-                                delay(2000)
-                                if (recentlyAddedProductName == addedProduct.name) {
-                                    recentlyAddedProductName = null
+                            if (!addedProduct.isOutOfStock) {
+                                onAddToCart(addedProduct)
+                                recentlyAddedProductName = addedProduct.name
+                                scope.launch {
+                                    delay(2000)
+                                    if (recentlyAddedProductName == addedProduct.name) {
+                                        recentlyAddedProductName = null
+                                    }
                                 }
                             }
                         }
@@ -1390,15 +1394,35 @@ fun ProductCard(
                 lineHeight = 20.sp
             )
 
-            // Weight/Unit Label
-            Text(
-                text = product.unit,
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 2.dp)
-            )
+            // Weight/Unit & Minimal Stock Availability Indicator
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = product.unit,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                val (stockLabel, stockLabelColor) = when {
+                    product.isOutOfStock -> "نفد المخزون" to AccentRed
+                    product.isLowStock -> "متبقي ${product.stockQuantity}" to AccentOrange
+                    else -> "متوفر" to FreshGreen
+                }
+                Text(
+                    text = stockLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = stockLabelColor,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.testTag("product_stock_status_${product.id}")
+                )
+            }
 
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -1427,19 +1451,24 @@ fun ProductCard(
                     }
                 }
 
-                // Fresh Green Add-to-Cart (+) Action Button with subtle scaling, elevation drop, and color-shifting feedback
+                // Fresh Green Add-to-Cart (+) Action Button — disabled when product is out of stock
                 FilledIconButton(
                     onClick = {
-                        buttonScope.launch {
-                            isAddPressed = true
-                            delay(140)
-                            isAddPressed = false
+                        if (!product.isOutOfStock) {
+                            buttonScope.launch {
+                                isAddPressed = true
+                                delay(140)
+                                isAddPressed = false
+                            }
+                            onAddToCart()
                         }
-                        onAddToCart()
                     },
+                    enabled = !product.isOutOfStock,
                     colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = buttonColor,
-                        contentColor = White
+                        contentColor = White,
+                        disabledContainerColor = BorderSubtle,
+                        disabledContentColor = TextMuted
                     ),
                     shape = CircleShape,
                     modifier = Modifier
@@ -1448,13 +1477,16 @@ fun ProductCard(
                             scaleX = scale
                             scaleY = scale
                         }
-                        .shadow(elevation = if (isAddPressed) 0.dp else 2.dp, shape = CircleShape)
-                        .semantics { contentDescription = "إضافة إلى السلة" }
+                        .shadow(elevation = if (isAddPressed || product.isOutOfStock) 0.dp else 2.dp, shape = CircleShape)
+                        .testTag("add_to_cart_button_${product.id}")
+                        .semantics {
+                            contentDescription = if (product.isOutOfStock) "نفد المخزون" else "إضافة إلى السلة"
+                        }
                 ) {
                     Icon(
                         imageVector = Icons.Default.Add,
                         contentDescription = null,
-                        tint = White,
+                        tint = if (product.isOutOfStock) TextMuted else White,
                         modifier = Modifier
                             .size(20.dp)
                             .graphicsLayer {

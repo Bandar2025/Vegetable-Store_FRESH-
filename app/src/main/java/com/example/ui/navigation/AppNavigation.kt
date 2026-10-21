@@ -1,6 +1,8 @@
 package com.example.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -20,6 +22,7 @@ import com.example.ui.screens.CreateAccountScreen
 import com.example.ui.screens.ForgotPasswordScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.LoginScreen
+import com.example.ui.screens.OrderHistoryScreen
 import com.example.ui.screens.ProductDetailScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.StoreOwnerFoundationScreen
@@ -35,6 +38,7 @@ import kotlinx.serialization.Serializable
 @Serializable data class ProductDetail(val productId: Int)
 @Serializable object Cart
 @Serializable object Checkout
+@Serializable object OrderHistory
 @Serializable object Login
 @Serializable object CreateAccount
 @Serializable object ForgotPassword
@@ -88,25 +92,27 @@ fun AppNavigation(
     val context = LocalContext.current
     val productRepository = remember(context) { Injection.provideProductRepository(context) }
     val cartRepository = remember(context) { Injection.provideCartRepository(context) }
+    val orderRepository = remember(context) { Injection.provideOrderRepository(context) }
     val authRepository = remember(context) { Injection.provideAuthRepository(context) }
 
     val authViewModel: AuthViewModel = authViewModelOverride ?: viewModel(
         factory = AuthViewModelFactory(authRepository)
     )
+    val cartViewModel: CartViewModel = viewModel(
+        factory = CartViewModelFactory(cartRepository, productRepository, orderRepository)
+    )
+    val currentUser by authViewModel.currentUser.collectAsState()
 
     NavHost(navController = navController, startDestination = Home) {
         composable<Home> {
             val viewModel: HomeViewModel = viewModel(
                 factory = HomeViewModelFactory(productRepository)
             )
-            val cartVm: CartViewModel = viewModel(
-                factory = CartViewModelFactory(cartRepository, productRepository)
-            )
             HomeScreen(
                 viewModel = viewModel,
                 onProductClick = { navController.navigate(ProductDetail(it.id)) },
                 onCartClick = { navController.navigate(Cart) },
-                onAddToCart = { product -> cartVm.addToCart(product.id, 1) },
+                onAddToCart = { product -> cartViewModel.addToCart(product.id, 1) },
                 onAccountClick = {
                     navController.navigate(AccountProfile) {
                         launchSingleTop = true
@@ -117,14 +123,13 @@ fun AppNavigation(
 
         composable<ProductDetail> { backStackEntry ->
             val args = backStackEntry.toRoute<ProductDetail>()
-            val cartVm: CartViewModel = viewModel(
-                factory = CartViewModelFactory(cartRepository, productRepository)
-            )
-            val product = Product(args.productId, "منتج تجريبي", "فئة", 1000, "وصف", "img", "حبة")
+            val allProducts by productRepository.getAllProducts().collectAsState(initial = emptyList())
+            val product = allProducts.find { it.id == args.productId }
+                ?: Product(args.productId, "منتج تجريبي", "فئة", 1000, "وصف", "img", "حبة")
             ProductDetailScreen(
                 product = product,
                 onAddToCart = {
-                    cartVm.addToCart(product.id, 1)
+                    cartViewModel.addToCart(product.id, 1)
                     navController.navigate(Cart)
                 },
                 onBack = { navController.popBackStack() }
@@ -132,26 +137,46 @@ fun AppNavigation(
         }
 
         composable<Cart> {
-            val viewModel: CartViewModel = viewModel(
-                factory = CartViewModelFactory(cartRepository, productRepository)
-            )
             CartScreen(
-                viewModel = viewModel,
+                viewModel = cartViewModel,
                 onCheckout = { navController.navigate(Checkout) },
-                onBack = { navController.popBackStack() }
+                onBack = { navController.popBackStack() },
+                onOpenOrderHistory = {
+                    navController.navigate(OrderHistory) {
+                        launchSingleTop = true
+                    }
+                }
             )
         }
 
         composable<Checkout> {
-            val viewModel: CartViewModel = viewModel(
-                factory = CartViewModelFactory(cartRepository, productRepository)
-            )
             CheckoutScreen(
-                viewModel = viewModel,
+                viewModel = cartViewModel,
+                currentUser = currentUser,
                 onConfirm = {
                     navController.navigate(Home) {
                         popUpTo(Home) { inclusive = true }
                         launchSingleTop = true
+                    }
+                },
+                onNavigateToOrderHistory = {
+                    navController.navigate(OrderHistory) {
+                        launchSingleTop = true
+                    }
+                },
+                onBack = { navController.popBackStack() }
+            )
+        }
+
+        composable<OrderHistory> {
+            OrderHistoryScreen(
+                cartViewModel = cartViewModel,
+                currentUser = currentUser,
+                onBack = {
+                    if (!navController.popBackStack()) {
+                        navController.navigate(Home) {
+                            launchSingleTop = true
+                        }
                     }
                 }
             )
@@ -260,6 +285,11 @@ fun AppNavigation(
                 },
                 onLoggedOut = {
                     navController.navigateAfterLogout()
+                },
+                onNavigateToOrderHistory = {
+                    navController.navigate(OrderHistory) {
+                        launchSingleTop = true
+                    }
                 }
             )
         }
@@ -291,8 +321,15 @@ fun AppNavigation(
         }
 
         composable<StoreManagement> {
+            val storeViewModel: com.example.ui.viewmodel.StoreManagementViewModel = viewModel(
+                factory = com.example.ui.viewmodel.StoreManagementViewModelFactory(
+                    repository = productRepository,
+                    orderRepository = orderRepository
+                )
+            )
             StoreOwnerFoundationScreen(
                 viewModel = authViewModel,
+                storeViewModel = storeViewModel,
                 onSwitchToCustomerStorefront = {
                     navController.navigate(Home) {
                         launchSingleTop = true
