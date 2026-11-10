@@ -35,6 +35,8 @@ import com.example.ui.viewmodel.HomeViewModelFactory
 import kotlinx.serialization.Serializable
 
 @Serializable object Home
+@Serializable object Categories
+@Serializable object Offers
 @Serializable data class ProductDetail(val productId: Int)
 @Serializable object Cart
 @Serializable object Checkout
@@ -117,7 +119,49 @@ fun AppNavigation(
                     navController.navigate(AccountProfile) {
                         launchSingleTop = true
                     }
+                },
+                onCategoriesClick = {
+                    navController.navigate(Categories) {
+                        launchSingleTop = true
+                    }
+                },
+                onOffersClick = {
+                    navController.navigate(Offers) {
+                        launchSingleTop = true
+                    }
                 }
+            )
+        }
+
+        composable<Categories> {
+            val viewModel: HomeViewModel = viewModel(
+                factory = HomeViewModelFactory(productRepository)
+            )
+            val allProducts by viewModel.products.collectAsState()
+            val isLoading by viewModel.isLoading.collectAsState()
+            com.example.ui.screens.CategoriesScreen(
+                products = allProducts,
+                isLoading = isLoading,
+                onProductClick = { navController.navigate(ProductDetail(it.id)) },
+                onAddToCart = { product -> cartViewModel.addToCart(product.id, 1) },
+                onBack = { navController.popBackStack() },
+                onCartClick = { navController.navigate(Cart) }
+            )
+        }
+
+        composable<Offers> {
+            val viewModel: HomeViewModel = viewModel(
+                factory = HomeViewModelFactory(productRepository)
+            )
+            val allProducts by viewModel.products.collectAsState()
+            val isLoading by viewModel.isLoading.collectAsState()
+            com.example.ui.screens.OffersScreen(
+                products = allProducts,
+                isLoading = isLoading,
+                onProductClick = { navController.navigate(ProductDetail(it.id)) },
+                onAddToCart = { product -> cartViewModel.addToCart(product.id, 1) },
+                onBack = { navController.popBackStack() },
+                onCartClick = { navController.navigate(Cart) }
             )
         }
 
@@ -128,8 +172,8 @@ fun AppNavigation(
                 ?: Product(args.productId, "منتج تجريبي", "فئة", 1000, "وصف", "img", "حبة")
             ProductDetailScreen(
                 product = product,
-                onAddToCart = {
-                    cartViewModel.addToCart(product.id, 1)
+                onAddToCart = { prod, qty ->
+                    cartViewModel.addToCart(prod.id, qty)
                     navController.navigate(Cart)
                 },
                 onBack = { navController.popBackStack() }

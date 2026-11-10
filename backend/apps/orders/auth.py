@@ -1050,17 +1050,10 @@ class ExpiringTokenAuthentication(TokenAuthentication):
 
 
 def _extract_client_ip(request) -> str:
-    meta = getattr(request, 'META', None)
-    if not isinstance(meta, dict):
-        underlying = getattr(request, '_request', None)
-        meta = getattr(underlying, 'META', {}) if underlying is not None else {}
-    xff = meta.get('HTTP_X_FORWARDED_FOR')
-    if isinstance(xff, str) and xff.strip():
-        return xff.split(',')[0].strip()[:100]
-    remote_addr = meta.get('REMOTE_ADDR')
-    if isinstance(remote_addr, str) and remote_addr.strip():
-        return remote_addr.strip()[:100]
-    return 'unknown'
+    from middleware.auth_rate_limit import extract_client_ip
+
+    return extract_client_ip(request)
+
 
 
 def _extract_normalized_username(request) -> str:
@@ -1451,153 +1444,12 @@ def enforce_auth_rate_limit(scope: str = 'login') -> Callable:
 enforce_login_rate_limit = enforce_auth_rate_limit('login')
 
 
-LOGIN_ENDPOINT_URL_NAMES = frozenset({
-    'auth-login',
-    'auth-token',
-    'login',
-})
+from middleware.auth_rate_limit import (
+    AuthRateLimitMiddleware,
+    FailedLoginAttemptMiddleware,
+    LOGIN_ENDPOINT_URL_NAMES,
+)
 
-
-class AuthRateLimitMiddleware:
-    """
-    Custom Django middleware using the Django cache framework (`django.core.cache`) to
-    both track and enforce `AUTH_MAX_FAILED_LOGIN_ATTEMPTS` and
-    `AUTH_FAILED_LOGIN_WINDOW_SECONDS` (as well as `AUTH_LOGIN_RATE_LIMIT_REQUESTS`)
-    for all login endpoints based on client IP addresses:
-    - Pre-request enforcement: checks the client IP's sliding-window failed-login counter
-      in `django.core.cache` (`auth:ratelimit:login_fail:ip:<client_ip>`) against
-      `settings.AUTH_MAX_FAILED_LOGIN_ATTEMPTS` within `AUTH_FAILED_LOGIN_WINDOW_SECONDS`.
-      If the limit is reached, immediately returns `429 Too Many Requests` with `Retry-After`.
-    - Post-response tracking: tracks authentication outcomes on all login endpoints by
-      recording failed login attempts (`status_code` in `400`, `401`, `403`) in
-      `django.core.cache` per client IP with TTL `AUTH_FAILED_LOGIN_WINDOW_SECONDS`, or
-      clearing the client IP's failed-login counter upon a successful `2xx` login response.
-    """
-
-    def __init__(self, get_response: Callable):
-        self.get_response = get_response
-
-    @staticmethod
-    def get_client_ip(request: HttpRequest) -> str:
-        return _extract_client_ip(request)
-
-    @staticmethod
-    def get_cache_key_for_ip(client_ip: str) -> str:
-        cleaned_ip = (client_ip or 'unknown').strip()[:100] or 'unknown'
-        return f"{CACHE_PREFIX_RL_LOGIN_FAIL_IP}{cleaned_ip}"
-
-    @classmethod
-    def get_failed_attempts_for_ip(
-        cls,
-        client_ip: str,
-        *,
-        now: datetime | None = None,
-    ) -> list[float]:
-        effective_now = now or timezone.now()
-        window_seconds = max(int(getattr(settings, 'AUTH_FAILED_LOGIN_WINDOW_SECONDS', 300)), 1)
-        cache_key = cls.get_cache_key_for_ip(client_ip)
-        return _get_cache_sliding_window_timestamps(
-            cache_key,
-            window_seconds,
-            effective_now.timestamp(),
-        )
-
-    @classmethod
-    def is_ip_locked_out(
-        cls,
-        client_ip: str,
-        *,
-        now: datetime | None = None,
-    ) -> tuple[bool, int]:
-        effective_now = now or timezone.now()
-        max_failed = max(int(getattr(settings, 'AUTH_MAX_FAILED_LOGIN_ATTEMPTS', 5)), 1)
-        window_seconds = max(int(getattr(settings, 'AUTH_FAILED_LOGIN_WINDOW_SECONDS', 300)), 1)
-        failures = cls.get_failed_attempts_for_ip(client_ip, now=effective_now)
-        if len(failures) >= max_failed:
-            retry_after = _compute_retry_after_seconds(
-                failures[0],
-                window_seconds,
-                effective_now,
-            )
-            return True, retry_after
-        return False, 0
-
-    @staticmethod
-    def is_login_endpoint(request: HttpRequest) -> bool:
-        path = (getattr(request, 'path_info', None) or getattr(request, 'path', '') or '').strip()
-        if path in LOGIN_RATE_LIMITED_PATHS:
-            return True
-        normalized = path.rstrip('/')
-        if normalized in ('/api/v1/auth/login', '/api/v1/auth/token'):
-            return True
-        try:
-            from django.urls import resolve
-
-            match = resolve(path)
-            if match.url_name in LOGIN_ENDPOINT_URL_NAMES:
-                return True
-        except Exception:
-            pass
-        return False
-
-    @staticmethod
-    def is_refresh_endpoint(request: HttpRequest) -> bool:
-        path = (getattr(request, 'path_info', None) or getattr(request, 'path', '') or '').strip()
-        return path in REFRESH_RATE_LIMITED_PATHS
-
-    def __call__(self, request: HttpRequest):
-        method = (getattr(request, 'method', '') or '').upper()
-
-        if method == 'POST':
-            if self.is_login_endpoint(request):
-                client_ip = self.get_client_ip(request)
-                locked_out, ip_wait_seconds = self.is_ip_locked_out(client_ip)
-                if locked_out:
-                    response = JsonResponse(
-                        {'detail': f'Request was throttled. Expected available in {ip_wait_seconds} seconds.'},
-                        status=status.HTTP_429_TOO_MANY_REQUESTS,
-                    )
-                    response['Retry-After'] = str(max(int(ip_wait_seconds), 1))
-                    return response
-
-                allowed, wait_seconds = check_and_record_login_rate_limit(request)
-                if not allowed:
-                    response = JsonResponse(
-                        {'detail': f'Request was throttled. Expected available in {wait_seconds} seconds.'},
-                        status=status.HTTP_429_TOO_MANY_REQUESTS,
-                    )
-                    response['Retry-After'] = str(max(int(wait_seconds), 1))
-                    return response
-
-                response = self.get_response(request)
-                status_code = getattr(response, 'status_code', 200)
-                if status_code in (
-                    status.HTTP_400_BAD_REQUEST,
-                    status.HTTP_401_UNAUTHORIZED,
-                    status.HTTP_403_FORBIDDEN,
-                ):
-                    record_failed_login_attempt(request)
-                elif 200 <= status_code < 300 and not getattr(
-                    request, '_auth_failed_login_cleared', False
-                ):
-                    clear_failed_login_attempts(request)
-                return response
-
-            if self.is_refresh_endpoint(request):
-                allowed, wait_seconds = check_and_record_refresh_rate_limit(request)
-                if not allowed:
-                    response = JsonResponse(
-                        {'detail': f'Request was throttled. Expected available in {wait_seconds} seconds.'},
-                        status=status.HTTP_429_TOO_MANY_REQUESTS,
-                    )
-                    response['Retry-After'] = str(max(int(wait_seconds), 1))
-                    return response
-
-        return self.get_response(request)
-
-
-# Descriptive alias for IP-based failed login attempt tracking & enforcement middleware
-FailedLoginAttemptMiddleware = AuthRateLimitMiddleware
 
 
 class LoginRateThrottle(BaseThrottle):

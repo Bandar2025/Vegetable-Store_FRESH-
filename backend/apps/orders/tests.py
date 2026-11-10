@@ -2486,8 +2486,14 @@ class TokenLifecycleAndRateLimitingDRFTests(DjangoTestCase):
         )
         from apps.orders.middleware import FailedLoginAttemptMiddleware
         from apps.orders.models import AuthThrottleEvent
+        from middleware.auth_rate_limit import (
+            AuthRateLimitMiddleware as RootAuthRateLimitMiddleware,
+            FailedLoginAttemptMiddleware as RootFailedLoginAttemptMiddleware,
+        )
 
         self.assertIs(FailedLoginAttemptMiddleware, AuthRateLimitMiddleware)
+        self.assertIs(RootAuthRateLimitMiddleware, AuthRateLimitMiddleware)
+        self.assertIs(RootFailedLoginAttemptMiddleware, AuthRateLimitMiddleware)
         cache.clear()
         AuthThrottleEvent.objects.all().delete()
         rf = RequestFactory()
@@ -2572,6 +2578,401 @@ class TokenLifecycleAndRateLimitingDRFTests(DjangoTestCase):
             )
             self.assertEqual(middleware(ok_req).status_code, 200)
             self.assertEqual(get_client_ip_failed_login_count('192.0.2.88'), 0)
+
+
+@unittest.skipUnless(
+    DJANGO_AVAILABLE,
+    "Django runtime is required for backend security configuration hardening tests.",
+)
+class BackendSecurityConfigurationHardeningTests(DjangoTestCase):
+    """
+    Tests for Micro Task 7B-5 — Backend Security Configuration Hardening:
+    1. Production configuration (`DEBUG` defaults to `False`) fails safely when required
+       `SECRET_KEY` or `ALLOWED_HOSTS` are missing, weak, dummy, or wildcard, or when
+       boolean/integer/environment settings are invalid.
+    2. Local development remains usable with explicit development settings (`DEBUG=True`).
+    3. Cache environment variable names (`CACHE_BACKEND`, `CACHE_LOCATION`) match the
+       implementation and `/backend/.env.example`, and `DISTRIBUTED_RATE_LIMITING_ENABLED`
+       is only True when a shared cache backend is configured.
+    4. HTTPS/cookie security settings and explicit trusted proxy / `X-Forwarded-For`
+       protections work as designed without trusting arbitrary `X-Forwarded-For` headers.
+    """
+
+    STRONG_PROD_SECRET = (
+        'Pr0d_S3cr3t_K3y_With_High_Entr0py_2026_!@#$%^&*()_+-=AbCdEfGhIjKlMnOpQrStUvWxYz'
+    )
+
+    def test_01_production_debug_defaults_to_false_and_fails_safely_on_missing_or_weak_secrets_and_hosts(self):
+        import importlib
+        import os
+        from unittest.mock import patch
+        from django.core.exceptions import ImproperlyConfigured
+        import fresh_api.settings as settings_module
+        from fresh_api.settings import (
+            LOCAL_DEV_FALLBACK_SECRET_KEY,
+            load_runtime_settings,
+        )
+
+        # 1. Empty environment defaults DEBUG to False and fails safely at module import and in load_runtime_settings
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings({})
+
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ImproperlyConfigured):
+                    importlib.reload(settings_module)
+        finally:
+            importlib.reload(settings_module)
+
+        # 2. Dummy / insecure / short / low-entropy SECRET_KEY values fail when DEBUG is False
+        invalid_prod_keys = [
+            '',
+            '   ',
+            'django-insecure-dummy-key',
+            LOCAL_DEV_FALLBACK_SECRET_KEY,
+            'django-insecure-' + ('x' * 60),
+            'local-dev-only-' + ('y' * 60),
+            'ShortKey#1234567890!',
+            'A' * 64,  # >= 50 chars, but only 1 distinct character
+        ]
+        for bad_key in invalid_prod_keys:
+            with self.subTest(bad_key=bad_key[:24]):
+                with self.assertRaises(ImproperlyConfigured):
+                    load_runtime_settings(
+                        {
+                            'DEBUG': 'False',
+                            'SECRET_KEY': bad_key,
+                            'ALLOWED_HOSTS': 'api.fresh.sa',
+                        }
+                    )
+
+        # 3. Missing, empty, wildcard, or malformed ALLOWED_HOSTS fail when DEBUG is False
+        invalid_prod_hosts = [
+            None,
+            '',
+            ' , ',
+            '*',
+            'api.fresh.sa,*',
+            'https://api.fresh.sa',
+            'api.fresh.sa/v1',
+        ]
+        for bad_hosts in invalid_prod_hosts:
+            env = {
+                'DEBUG': 'False',
+                'SECRET_KEY': self.STRONG_PROD_SECRET,
+            }
+            if bad_hosts is not None:
+                env['ALLOWED_HOSTS'] = bad_hosts
+            with self.subTest(bad_hosts=bad_hosts):
+                with self.assertRaises(ImproperlyConfigured):
+                    load_runtime_settings(env)
+
+        # 4. Invalid DEBUG boolean string or DJANGO_ENV=production + DEBUG=True fails safely
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'invalid_boolean',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                }
+            )
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DJANGO_ENV': 'production',
+                    'DEBUG': 'True',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                }
+            )
+
+        # 5. Valid production configuration succeeds with DEBUG defaulting to False and hardened HTTPS/cookie defaults
+        prod_cfg = load_runtime_settings(
+            {
+                'SECRET_KEY': self.STRONG_PROD_SECRET,
+                'ALLOWED_HOSTS': 'api.fresh.sa, internal.fresh.sa',
+            }
+        )
+        self.assertFalse(prod_cfg['DEBUG'])
+        self.assertEqual(prod_cfg['ALLOWED_HOSTS'], ['api.fresh.sa', 'internal.fresh.sa'])
+        self.assertTrue(prod_cfg['SESSION_COOKIE_SECURE'])
+        self.assertTrue(prod_cfg['CSRF_COOKIE_SECURE'])
+        self.assertTrue(prod_cfg['SESSION_COOKIE_HTTPONLY'])
+        self.assertTrue(prod_cfg['CSRF_COOKIE_HTTPONLY'])
+        self.assertTrue(prod_cfg['SECURE_SSL_REDIRECT'])
+        self.assertEqual(prod_cfg['SECURE_HSTS_SECONDS'], 31536000)
+        self.assertTrue(prod_cfg['SECURE_HSTS_INCLUDE_SUBDOMAINS'])
+        self.assertTrue(prod_cfg['SECURE_HSTS_PRELOAD'])
+        self.assertTrue(prod_cfg['SECURE_CONTENT_TYPE_NOSNIFF'])
+        self.assertEqual(prod_cfg['X_FRAME_OPTIONS'], 'DENY')
+        self.assertIsNone(prod_cfg['SECURE_PROXY_SSL_HEADER'])
+        self.assertFalse(prod_cfg['TRUST_X_FORWARDED_FOR'])
+
+        # Disabling secure cookies or using HTTP CSRF_TRUSTED_ORIGINS in production fails safely
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'False',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                    'SESSION_COOKIE_SECURE': 'False',
+                }
+            )
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'False',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                    'CSRF_TRUSTED_ORIGINS': 'http://api.fresh.sa',
+                }
+            )
+
+    def test_02_local_development_usable_with_explicit_development_settings_and_env_example(self):
+        from pathlib import Path
+        from fresh_api.settings import (
+            BASE_DIR,
+            LOCAL_DEV_CACHE_BACKEND,
+            LOCAL_DEV_CACHE_LOCATION,
+            load_runtime_settings,
+        )
+
+        # 1. Minimal explicit development setting (DEBUG=True) works cleanly
+        dev_cfg = load_runtime_settings({'DEBUG': 'True'})
+        self.assertTrue(dev_cfg['DEBUG'])
+        self.assertEqual(dev_cfg['ALLOWED_HOSTS'], ['127.0.0.1', 'localhost'])
+        self.assertEqual(
+            dev_cfg['CACHES']['default']['BACKEND'],
+            LOCAL_DEV_CACHE_BACKEND,
+        )
+        self.assertEqual(
+            dev_cfg['CACHES']['default']['LOCATION'],
+            LOCAL_DEV_CACHE_LOCATION,
+        )
+        self.assertFalse(dev_cfg['DISTRIBUTED_RATE_LIMITING_ENABLED'])
+        self.assertFalse(dev_cfg['SESSION_COOKIE_SECURE'])
+        self.assertFalse(dev_cfg['CSRF_COOKIE_SECURE'])
+        self.assertFalse(dev_cfg['SECURE_SSL_REDIRECT'])
+
+        # 2. Parse `/backend/.env.example` and verify it loads cleanly as local development config
+        env_example_path = Path(BASE_DIR) / '.env.example'
+        self.assertTrue(env_example_path.is_file())
+        parsed_env: dict[str, str] = {}
+        for raw_line in env_example_path.read_text(encoding='utf-8').splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, val = line.split('=', 1)
+            parsed_env[key.strip()] = val.strip()
+
+        self.assertEqual(parsed_env.get('DEBUG'), 'True')
+        self.assertIn('CACHE_BACKEND', parsed_env)
+        self.assertIn('CACHE_LOCATION', parsed_env)
+        self.assertNotIn('DJANGO_CACHE_BACKEND', parsed_env)
+        self.assertNotIn('DJANGO_CACHE_LOCATION', parsed_env)
+
+        example_cfg = load_runtime_settings(parsed_env)
+        self.assertTrue(example_cfg['DEBUG'])
+        self.assertEqual(example_cfg['ALLOWED_HOSTS'], ['127.0.0.1', 'localhost'])
+        self.assertFalse(example_cfg['DISTRIBUTED_RATE_LIMITING_ENABLED'])
+
+    def test_03_cache_environment_variable_alignment_and_distributed_rate_limit_verification(self):
+        from django.core.exceptions import ImproperlyConfigured
+        from fresh_api.settings import load_runtime_settings
+
+        # 1. Legacy DJANGO_CACHE_BACKEND / DJANGO_CACHE_LOCATION is rejected so misconfigurations do not silently fall back
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'True',
+                    'DJANGO_CACHE_BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                    'DJANGO_CACHE_LOCATION': 'redis://127.0.0.1:6379/1',
+                }
+            )
+
+        # 2. DummyCache is rejected when DEBUG=False
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'False',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                    'CACHE_BACKEND': 'django.core.cache.backends.dummy.DummyCache',
+                }
+            )
+
+        # 3. REQUIRE_SHARED_CACHE=True rejects LocMemCache
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'False',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                    'CACHE_BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+                    'REQUIRE_SHARED_CACHE': 'True',
+                }
+            )
+
+        # 4. RedisCache requires an explicit, valid redis:// or rediss:// CACHE_LOCATION
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'False',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                    'CACHE_BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                }
+            )
+        with self.assertRaises(ImproperlyConfigured):
+            load_runtime_settings(
+                {
+                    'DEBUG': 'False',
+                    'SECRET_KEY': self.STRONG_PROD_SECRET,
+                    'ALLOWED_HOSTS': 'api.fresh.sa',
+                    'CACHE_BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                    'CACHE_LOCATION': 'http://not-a-redis-url:6379/1',
+                }
+            )
+
+        # 5. Valid RedisCache configuration enables DISTRIBUTED_RATE_LIMITING_ENABLED=True
+        redis_cfg = load_runtime_settings(
+            {
+                'DEBUG': 'False',
+                'SECRET_KEY': self.STRONG_PROD_SECRET,
+                'ALLOWED_HOSTS': 'api.fresh.sa',
+                'CACHE_BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                'CACHE_LOCATION': 'redis://127.0.0.1:6379/1',
+                'REQUIRE_SHARED_CACHE': 'True',
+            }
+        )
+        self.assertTrue(redis_cfg['DISTRIBUTED_RATE_LIMITING_ENABLED'])
+        self.assertEqual(
+            redis_cfg['CACHES']['default'],
+            {
+                'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                'LOCATION': 'redis://127.0.0.1:6379/1',
+            },
+        )
+
+    def test_04_trusted_proxy_settings_and_untrusted_x_forwarded_for_protection(self):
+        import json
+        from django.core.cache import cache
+        from django.core.exceptions import ImproperlyConfigured
+        from django.http import HttpResponse
+        from django.test import RequestFactory, override_settings
+        from fresh_api.settings import load_runtime_settings
+        from middleware.auth_rate_limit import (
+            AuthRateLimitMiddleware,
+            extract_client_ip,
+            get_client_ip_failed_login_count,
+        )
+        from apps.orders.models import AuthThrottleEvent
+
+        # 1. Enabling TRUST_X_FORWARDED_FOR or TRUST_X_FORWARDED_PROTO without TRUSTED_PROXY_IPS fails safely
+        for proxy_flag in ('TRUST_X_FORWARDED_FOR', 'TRUST_X_FORWARDED_PROTO', 'USE_X_FORWARDED_HOST'):
+            with self.subTest(proxy_flag=proxy_flag):
+                with self.assertRaises(ImproperlyConfigured):
+                    load_runtime_settings(
+                        {
+                            'DEBUG': 'False',
+                            'SECRET_KEY': self.STRONG_PROD_SECRET,
+                            'ALLOWED_HOSTS': 'api.fresh.sa',
+                            proxy_flag: 'True',
+                        }
+                    )
+
+        # Wildcard or malformed TRUSTED_PROXY_IPS is rejected
+        for bad_proxy in ('*', 'not-an-ip', '10.0.0.999'):
+            with self.assertRaises(ImproperlyConfigured):
+                load_runtime_settings(
+                    {
+                        'DEBUG': 'False',
+                        'SECRET_KEY': self.STRONG_PROD_SECRET,
+                        'ALLOWED_HOSTS': 'api.fresh.sa',
+                        'TRUST_X_FORWARDED_FOR': 'True',
+                        'TRUSTED_PROXY_IPS': bad_proxy,
+                    }
+                )
+
+        # Valid proxy configuration sets SECURE_PROXY_SSL_HEADER and TRUSTED_PROXY_IPS
+        proxy_cfg = load_runtime_settings(
+            {
+                'DEBUG': 'False',
+                'SECRET_KEY': self.STRONG_PROD_SECRET,
+                'ALLOWED_HOSTS': 'api.fresh.sa',
+                'TRUST_X_FORWARDED_FOR': 'True',
+                'TRUST_X_FORWARDED_PROTO': 'True',
+                'TRUSTED_PROXY_IPS': '10.0.0.0/24, 192.168.1.10',
+            }
+        )
+        self.assertEqual(
+            proxy_cfg['SECURE_PROXY_SSL_HEADER'],
+            ('HTTP_X_FORWARDED_PROTO', 'https'),
+        )
+        self.assertEqual(
+            proxy_cfg['TRUSTED_PROXY_IPS'],
+            ('10.0.0.0/24', '192.168.1.10'),
+        )
+
+        # 2. Verify runtime X-Forwarded-For spoofing protection in extract_client_ip and AuthRateLimitMiddleware
+        rf = RequestFactory()
+        cache.clear()
+        AuthThrottleEvent.objects.all().delete()
+        middleware = AuthRateLimitMiddleware(lambda req: HttpResponse('Unauthorized', status=401))
+
+        # Default (TRUST_X_FORWARDED_FOR=False): spoofed X-Forwarded-For headers from client are ignored!
+        with override_settings(
+            TRUST_X_FORWARDED_FOR=False,
+            TRUSTED_PROXY_IPS=(),
+            AUTH_MAX_FAILED_LOGIN_ATTEMPTS=2,
+            AUTH_FAILED_LOGIN_WINDOW_SECONDS=300,
+            AUTH_LOGIN_RATE_LIMIT_REQUESTS=50,
+        ):
+            for idx in range(2):
+                req = rf.post(
+                    '/api/v1/auth/login/',
+                    data=json.dumps({'username': f'u{idx}', 'password': 'bad'}),
+                    content_type='application/json',
+                    REMOTE_ADDR='198.51.100.77',
+                    HTTP_X_FORWARDED_FOR=f'203.0.113.{10 + idx}',
+                )
+                self.assertEqual(extract_client_ip(req), '198.51.100.77')
+                self.assertEqual(middleware(req).status_code, 401)
+
+            # 3rd attempt with a new spoofed X-Forwarded-For from the same REMOTE_ADDR is blocked with 429
+            req_spoofed = rf.post(
+                '/api/v1/auth/login/',
+                data=json.dumps({'username': 'u3', 'password': 'bad'}),
+                content_type='application/json',
+                REMOTE_ADDR='198.51.100.77',
+                HTTP_X_FORWARDED_FOR='203.0.113.250',
+            )
+            self.assertEqual(middleware(req_spoofed).status_code, 429)
+            self.assertEqual(get_client_ip_failed_login_count('198.51.100.77'), 2)
+            self.assertEqual(get_client_ip_failed_login_count('203.0.113.10'), 0)
+
+        # 3. When TRUST_X_FORWARDED_FOR=True and REMOTE_ADDR is in TRUSTED_PROXY_IPS,
+        # right-most untrusted hop is extracted (ignoring spoofed left-side XFF hops)
+        with override_settings(
+            TRUST_X_FORWARDED_FOR=True,
+            TRUSTED_PROXY_IPS=('10.0.0.0/24',),
+        ):
+            # Request from untrusted peer (not in 10.0.0.0/24) still ignores X-Forwarded-For
+            untrusted_peer_req = rf.post(
+                '/api/v1/auth/login/',
+                REMOTE_ADDR='198.51.100.88',
+                HTTP_X_FORWARDED_FOR='203.0.113.5',
+            )
+            self.assertEqual(extract_client_ip(untrusted_peer_req), '198.51.100.88')
+
+            # Request from trusted proxy (10.0.0.5) extracts real client IP (203.0.113.42),
+            # ignoring attacker-prepended spoofed hop (1.1.1.1) and intermediate trusted proxy (10.0.0.2)
+            trusted_proxy_req = rf.post(
+                '/api/v1/auth/login/',
+                REMOTE_ADDR='10.0.0.5',
+                HTTP_X_FORWARDED_FOR='1.1.1.1, 203.0.113.42, 10.0.0.2',
+            )
+            self.assertEqual(extract_client_ip(trusted_proxy_req), '203.0.113.42')
 
 
 

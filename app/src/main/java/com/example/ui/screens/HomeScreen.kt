@@ -83,7 +83,9 @@ fun HomeScreen(
     onProductClick: (Product) -> Unit,
     onCartClick: () -> Unit = {},
     onAddToCart: (Product) -> Unit = {},
-    onAccountClick: () -> Unit = {}
+    onAccountClick: () -> Unit = {},
+    onCategoriesClick: () -> Unit = {},
+    onOffersClick: () -> Unit = {}
 ) {
     val products by viewModel.products.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
@@ -141,6 +143,8 @@ fun HomeScreen(
                     selectedIndex = selectedNavIndex,
                     onItemSelected = { index ->
                         when (index) {
+                            1 -> onCategoriesClick()
+                            2 -> onOffersClick()
                             3 -> onCartClick()
                             4 -> onAccountClick()
                             else -> selectedNavIndex = index
