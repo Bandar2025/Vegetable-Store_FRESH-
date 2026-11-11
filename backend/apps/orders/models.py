@@ -91,7 +91,7 @@ class Order(models.Model):
     )
     # Using BigIntegerField for halalas; computed server-side from OrderItem line totals
     total_halalas = models.BigIntegerField(default=0)
-    idempotency_key = models.CharField(max_length=128, null=True, blank=True, unique=True)
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True)
     cancellation_restored = models.BooleanField(default=False)
     timestamp = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -100,6 +100,14 @@ class Order(models.Model):
         db_table = 'orders_order'
         ordering = ['-timestamp', '-id']
         constraints = [
+            UniqueConstraint(
+                fields=['customer_id', 'idempotency_key'],
+                name='uniq_order_customer_idempotency_key',
+            ),
+            CheckConstraint(
+                check=Q(idempotency_key__isnull=True) | ~Q(idempotency_key=''),
+                name='order_idempotency_key_non_empty',
+            ),
             CheckConstraint(
                 check=Q(total_halalas__gte=0),
                 name='order_total_halalas_gte_0',

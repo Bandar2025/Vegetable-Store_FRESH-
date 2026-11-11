@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import com.example.data.api.FreshApiService
+import com.example.data.api.model.ProductDto
 import com.example.data.local.dao.ProductDao
 import com.example.data.local.dao.StockAdjustmentDao
 import com.example.data.local.model.Product
@@ -29,9 +30,12 @@ sealed class StockAdjustmentOutcome {
 class ProductRepository(
     private val productDao: ProductDao,
     private val apiService: FreshApiService,
-    private val stockAdjustmentDao: StockAdjustmentDao? = null
+    private val stockAdjustmentDao: StockAdjustmentDao? = null,
+    private val stockMutex: Mutex = Mutex()
 ) {
-    private val stockMutex = Mutex()
+    internal val synchronizationMutex: Mutex
+        get() = stockMutex
+
     private val fallbackAdjustmentsFlow = MutableStateFlow<List<StockAdjustment>>(emptyList())
     private var nextFallbackAdjustmentId = 1L
 
@@ -48,12 +52,14 @@ class ProductRepository(
 
     suspend fun ensureInitialData() {
         withContext(Dispatchers.IO) {
-            try {
-                if (productDao.count() == 0) {
-                    productDao.insertAll(initialProducts)
+            stockMutex.withLock {
+                try {
+                    if (productDao.count() == 0) {
+                        productDao.insertAll(initialProducts)
+                    }
+                } catch (e: Exception) {
+                    // Ignore DB error
                 }
-            } catch (e: Exception) {
-                // Ignore DB error
             }
         }
     }
@@ -62,20 +68,21 @@ class ProductRepository(
         withContext(Dispatchers.IO) {
             try {
                 val dtos = apiService.getProducts()
-                val entities = dtos.map { dto ->
-                    Product(
-                        id = dto.id,
-                        name = dto.name,
-                        category = dto.category.name,
-                        priceHalalas = dto.priceHalalas.toInt(),
-                        description = dto.description,
-                        imageUrl = dto.imageUrl,
-                        unit = dto.unit
-                    )
+                stockMutex.withLock {
+                    if (dtos.isNotEmpty()) {
+                        val existingProducts = productDao.getAllProductsOnce()
+                        val mergedEntities = mergeRemoteProductsPreservingLocalState(
+                            existingProducts = existingProducts,
+                            remoteDtos = dtos,
+                            timestampMillis = System.currentTimeMillis()
+                        )
+                        productDao.insertAll(mergedEntities)
+                    } else if (productDao.count() == 0) {
+                        productDao.insertAll(initialProducts)
+                    }
                 }
-                productDao.insertAll(entities)
             } catch (e: Exception) {
-                // Network unavailable; fallback to initial products if local DB is empty
+                // Network unavailable; fallback to initial products only if local DB is empty
                 ensureInitialData()
             }
         }
@@ -242,6 +249,45 @@ class ProductRepository(
 
     companion object {
         val SUPPORTED_CATEGORIES = listOf("فواكه", "خضروات", "ورقيات", "تمور")
+
+        /**
+         * Merges incoming [remoteDtos] with [existingProducts] so that local inventory balances
+         * (`stockQuantity`, `stockSubUnitsMillis`), `lowStockThreshold`, `expiryDate`,
+         * `isActive`, `isArchived`, and `nameEn` are never overwritten with default values.
+         */
+        fun mergeRemoteProductsPreservingLocalState(
+            existingProducts: List<Product>,
+            remoteDtos: List<ProductDto>,
+            timestampMillis: Long = System.currentTimeMillis()
+        ): List<Product> {
+            val existingById = existingProducts.associateBy { it.id }
+            return remoteDtos.map { dto ->
+                val authoritativePriceHalalas = dto.resolvedPriceHalalas.toInt()
+                val local = existingById[dto.id]
+                if (local != null) {
+                    local.copy(
+                        name = dto.name,
+                        category = dto.category.name,
+                        priceHalalas = authoritativePriceHalalas,
+                        description = dto.description,
+                        imageUrl = dto.imageUrl,
+                        unit = dto.unit,
+                        updatedAtMillis = timestampMillis
+                    )
+                } else {
+                    Product(
+                        id = dto.id,
+                        name = dto.name,
+                        category = dto.category.name,
+                        priceHalalas = authoritativePriceHalalas,
+                        description = dto.description,
+                        imageUrl = dto.imageUrl,
+                        unit = dto.unit,
+                        updatedAtMillis = timestampMillis
+                    )
+                }
+            }
+        }
 
         val SUPPORTED_UNITS = listOf(
             "كيلوجرام",

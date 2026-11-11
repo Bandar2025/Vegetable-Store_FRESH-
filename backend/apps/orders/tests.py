@@ -1,4 +1,5 @@
 import ast
+import json
 from pathlib import Path
 import sqlite3
 import unittest
@@ -163,12 +164,14 @@ def create_full_sqlite_schema(conn: sqlite3.Connection) -> None:
             customer_id VARCHAR(100) NOT NULL,
             status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
             total_halalas INTEGER NOT NULL DEFAULT 0,
-            idempotency_key VARCHAR(128) NULL UNIQUE,
+            idempotency_key VARCHAR(128) NULL,
             cancellation_restored BOOLEAN NOT NULL DEFAULT 0,
             timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT uniq_order_customer_idempotency_key UNIQUE (customer_id, idempotency_key),
             CONSTRAINT order_total_halalas_gte_0 CHECK (total_halalas >= 0),
             CONSTRAINT order_customer_id_non_empty CHECK (customer_id <> ''),
+            CONSTRAINT order_idempotency_key_non_empty CHECK (idempotency_key IS NULL OR idempotency_key <> ''),
             CONSTRAINT order_status_valid_choice CHECK (
                 status IN ('PENDING', 'CONFIRMED', 'PROCESSING', 'COMPLETED', 'CANCELLED')
             )
@@ -1573,8 +1576,15 @@ class AuthenticationAndAuthorizationDRFTests(DjangoTestCase):
             ).status_code,
             401,
         )
-        self.assertEqual(self.client_unauth.get('/api/v1/products/').status_code, 401)
-        self.assertEqual(self.client_unauth.get('/api/v1/categories/').status_code, 401)
+        # Public guest catalog read is allowed (200), while writes and branch-scoped queries are rejected (401)
+        self.assertEqual(self.client_unauth.get('/api/v1/products/').status_code, 200)
+        self.assertEqual(self.client_unauth.get('/api/v1/categories/').status_code, 200)
+        self.assertEqual(
+            self.client_unauth.get(f'/api/v1/products/?branch_id={self.branch_1.id}').status_code,
+            401,
+        )
+        self.assertEqual(self.client_unauth.post('/api/v1/products/', {}, format='json').status_code, 401)
+        self.assertEqual(self.client_unauth.post('/api/v1/categories/', {}, format='json').status_code, 401)
         self.assertEqual(self.client_unauth.get('/api/v1/auth/me/').status_code, 401)
 
     def test_03_login_identity_resolution_and_inactive_account_store_branch_rejection(self):
@@ -2973,6 +2983,1439 @@ class BackendSecurityConfigurationHardeningTests(DjangoTestCase):
                 HTTP_X_FORWARDED_FOR='1.1.1.1, 203.0.113.42, 10.0.0.2',
             )
             self.assertEqual(extract_client_ip(trusted_proxy_req), '203.0.113.42')
+
+
+class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
+    """
+    Microtask 1C Backend Verification Suite (runs in standalone Python + SQLite3 as well as Django):
+    1. Valid customer registration (`POST /api/v1/auth/register/` contract).
+    2. Rejection of duplicate email, username, and phone_number.
+    3. Rejection of weak passwords and mismatched confirm_password.
+    4. Strict rejection of `role`, `OWNER`, `BRANCH_MANAGER`, `ADMIN`, `is_staff`, `is_superuser`,
+       `branch_id`, and `store_id` in registration requests.
+    5. Cryptographic PBKDF2-SHA256 password hashing in DB and zero password leakage in responses.
+    6. Login (`POST /api/v1/auth/login/`) by username or email and JWT token pair issuance.
+    7. Refresh token rotation (`POST /api/v1/auth/refresh/`) and immediate invalidation of prior pair.
+    8. Refresh token replay/reuse detection (`REUSE_DETECTED`) revoking the entire token family.
+    9. Logout (`POST /api/v1/auth/logout/`) immediately revoking access and refresh tokens.
+    10. Rate limiting (`429 Too Many Requests`) on repeated failed login/registration and refresh attempts.
+    """
+
+    def setUp(self):
+        from apps.orders.auth import (
+            cache,
+            clear_rate_limit_cache,
+            ensure_sqlite_auth_schema,
+        )
+
+        clear_rate_limit_cache()
+        cache.clear()
+        self.conn = sqlite3.connect(':memory:')
+        create_full_sqlite_schema(self.conn)
+        ensure_sqlite_auth_schema(self.conn)
+
+    def tearDown(self):
+        from apps.orders.auth import cache, clear_rate_limit_cache
+
+        self.conn.close()
+        clear_rate_limit_cache()
+        cache.clear()
+
+    def test_01_valid_customer_registration_provisions_customer_profile_and_jwt_pair(self):
+        from apps.orders.auth import (
+            authenticate_access_token_sqlite,
+            decode_and_verify_jwt,
+            register_customer_account,
+        )
+
+        payload = register_customer_account(
+            {
+                'full_name': 'عبدالله القحطاني',
+                'email': 'Abdullah.Q@Fresh.sa',
+                'phone_number': '+966 55 123 4567',
+                'password': 'FreshUser#2026',
+                'confirm_password': 'FreshUser#2026',
+            },
+            conn=self.conn,
+        )
+
+        self.assertEqual(payload['role'], 'CUSTOMER')
+        self.assertEqual(payload['email'], 'abdullah.q@fresh.sa')
+        self.assertEqual(payload['username'], 'abdullah.q@fresh.sa')
+        self.assertEqual(payload['full_name'], 'عبدالله القحطاني')
+        self.assertEqual(payload['phone_number'], '0551234567')
+        self.assertTrue(payload['customer_id'].startswith('cust-user-'))
+        self.assertIsNone(payload['store_id'])
+        self.assertIsNone(payload['authorized_branch_ids'])
+
+        # Verify access & refresh JWTs are valid HS256 tokens and can access /api/v1/auth/me/
+        access_claims = decode_and_verify_jwt(payload['access_token'], expected_type='access')
+        refresh_claims = decode_and_verify_jwt(payload['refresh_token'], expected_type='refresh')
+        self.assertEqual(access_claims['family_id'], refresh_claims['family_id'])
+
+        me_info = authenticate_access_token_sqlite(
+            self.conn,
+            f"Bearer {payload['access_token']}",
+        )
+        self.assertEqual(me_info['role'], 'CUSTOMER')
+        self.assertEqual(me_info['customer_id'], payload['customer_id'])
+        self.assertIsNone(me_info['store_id'])
+        self.assertIsNone(me_info['authorized_branch_ids'])
+
+    def test_02_duplicate_email_username_and_phone_number_rejected(self):
+        from apps.orders.auth import (
+            CustomerRegistrationValidationError,
+            register_customer_account,
+        )
+
+        register_customer_account(
+            {
+                'username': 'sara_customer',
+                'full_name': 'سارة العتيبي',
+                'email': 'sara@fresh.sa',
+                'phone_number': '0501112233',
+                'password': 'SafePass123!',
+            },
+            conn=self.conn,
+        )
+
+        # Duplicate email (case-insensitive)
+        with self.assertRaises(CustomerRegistrationValidationError) as ctx_email:
+            register_customer_account(
+                {
+                    'username': 'sara_other',
+                    'full_name': 'سارة أخرى',
+                    'email': 'SARA@FRESH.SA',
+                    'phone_number': '0509998877',
+                    'password': 'SafePass123!',
+                },
+                conn=self.conn,
+            )
+        self.assertIn('email', ctx_email.exception.errors)
+
+        # Duplicate username (case-insensitive)
+        with self.assertRaises(CustomerRegistrationValidationError) as ctx_user:
+            register_customer_account(
+                {
+                    'username': 'SARA_CUSTOMER',
+                    'full_name': 'سارة ثانية',
+                    'email': 'sara2@fresh.sa',
+                    'phone_number': '0509998877',
+                    'password': 'SafePass123!',
+                },
+                conn=self.conn,
+            )
+        self.assertIn('username', ctx_user.exception.errors)
+
+        # Duplicate phone_number (even in +9665 format)
+        with self.assertRaises(CustomerRegistrationValidationError) as ctx_phone:
+            register_customer_account(
+                {
+                    'username': 'sara_third',
+                    'full_name': 'سارة ثالثة',
+                    'email': 'sara3@fresh.sa',
+                    'phone_number': '+966501112233',
+                    'password': 'SafePass123!',
+                },
+                conn=self.conn,
+            )
+        self.assertIn('phone_number', ctx_phone.exception.errors)
+
+    def test_03_weak_passwords_and_mismatched_confirmation_rejected(self):
+        from apps.orders.auth import (
+            CustomerRegistrationValidationError,
+            register_customer_account,
+        )
+
+        weak_passwords = [
+            '',
+            'short1',
+            '1234567890',       # digits only
+            'abcdefghijk',      # letters only
+            'password123',      # common weak password
+            'khalid@fresh.sa',  # matches email
+        ]
+        for bad_pw in weak_passwords:
+            with self.subTest(bad_pw=bad_pw):
+                with self.assertRaises(CustomerRegistrationValidationError) as ctx:
+                    register_customer_account(
+                        {
+                            'full_name': 'خالد الحربي',
+                            'email': 'khalid@fresh.sa',
+                            'phone_number': '0554443322',
+                            'password': bad_pw,
+                        },
+                        conn=self.conn,
+                    )
+                self.assertIn('password', ctx.exception.errors)
+
+        # Mismatched confirm_password rejected
+        with self.assertRaises(CustomerRegistrationValidationError) as ctx_mismatch:
+            register_customer_account(
+                {
+                    'full_name': 'خالد الحربي',
+                    'email': 'khalid@fresh.sa',
+                    'phone_number': '0554443322',
+                    'password': 'ValidPass123!',
+                    'confirm_password': 'DifferentPass123!',
+                },
+                conn=self.conn,
+            )
+        self.assertIn('confirm_password', ctx_mismatch.exception.errors)
+
+    def test_04_role_and_privilege_escalation_fields_strictly_rejected(self):
+        from apps.orders.auth import (
+            CustomerRegistrationValidationError,
+            register_customer_account,
+        )
+
+        forbidden_payloads = [
+            {'role': 'OWNER'},
+            {'role': 'BRANCH_MANAGER'},
+            {'role': 'ADMIN'},
+            {'role': 'STORE_OWNER'},
+            {'role': 'CUSTOMER'},
+            {'actor_role': 'OWNER'},
+            {'is_staff': True},
+            {'is_superuser': True},
+            {'branch_id': 1},
+            {'store_id': 1},
+            {'authorized_branch_ids': [1]},
+            {'customer_id': 'cust-spoofed'},
+            {'actor_id': 'user:1'},
+        ]
+        for extra in forbidden_payloads:
+            with self.subTest(extra=extra):
+                body = {
+                    'full_name': 'عميل يحاول تصعيد الصلاحية',
+                    'email': 'escalate@fresh.sa',
+                    'phone_number': '0561112233',
+                    'password': 'StrongPass123!',
+                    **extra,
+                }
+                with self.assertRaises(CustomerRegistrationValidationError):
+                    register_customer_account(body, conn=self.conn)
+
+        # Ensure zero users were created from any privilege-escalation attempt
+        count = self.conn.execute('SELECT COUNT(*) FROM auth_user').fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_05_password_hashed_with_pbkdf2_sha256_and_never_returned_in_response(self):
+        from apps.orders.auth import (
+            hash_opaque_token,
+            identify_hasher,
+            register_customer_account,
+        )
+
+        raw_pw = 'MySecret#Pass2026'
+        response = register_customer_account(
+            {
+                'full_name': 'فهد الدوسري',
+                'email': 'fahad@fresh.sa',
+                'phone_number': '0541239876',
+                'password': raw_pw,
+            },
+            conn=self.conn,
+        )
+
+        # Password or hash is never in the response payload
+        self.assertNotIn('password', response)
+        self.assertNotIn(raw_pw, json.dumps(response))
+        self.assertNotIn('pbkdf2_sha256$', json.dumps(response))
+
+        # Database stores PBKDF2-SHA256 hash for password and SHA-256 hash for tokens
+        row = self.conn.execute(
+            'SELECT password, is_staff, is_superuser FROM auth_user WHERE email = ?',
+            ('fahad@fresh.sa',),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row[0], raw_pw)
+        self.assertTrue(row[0].startswith('pbkdf2_sha256$'))
+        self.assertEqual(identify_hasher(row[0]), 'pbkdf2_sha256')
+        self.assertEqual(row[1], 0)
+        self.assertEqual(row[2], 0)
+
+        tok_row = self.conn.execute(
+            'SELECT access_token_hash, refresh_token_hash FROM orders_authsessiontoken'
+        ).fetchone()
+        self.assertEqual(tok_row[0], hash_opaque_token(response['access_token']))
+        self.assertEqual(tok_row[1], hash_opaque_token(response['refresh_token']))
+
+    def test_06_login_by_username_or_email_and_generic_error_on_invalid_credentials(self):
+        from apps.orders.auth import (
+            GENERIC_INVALID_CREDENTIALS_MESSAGE,
+             login_with_credentials_sqlite,
+            register_customer_account,
+        )
+
+        register_customer_account(
+            {
+                'username': 'noura_k',
+                'full_name': 'نورة الخالدي',
+                'email': 'noura@fresh.sa',
+                'phone_number': '0531234567',
+                'password': 'NouraPass#2026',
+            },
+            conn=self.conn,
+        )
+
+        # Login by username
+        login_by_user = login_with_credentials_sqlite(
+            self.conn,
+            'noura_k',
+            'NouraPass#2026',
+        )
+        self.assertEqual(login_by_user['role'], 'CUSTOMER')
+        self.assertEqual(login_by_user['email'], 'noura@fresh.sa')
+
+        # Login by email (case-insensitive)
+        login_by_email = login_with_credentials_sqlite(
+            self.conn,
+            'NOURA@FRESH.SA',
+            'NouraPass#2026',
+        )
+        self.assertEqual(login_by_email['username'], 'noura_k')
+        self.assertEqual(login_by_email['customer_id'], login_by_user['customer_id'])
+
+        # Wrong password and unknown user return identical generic message
+        for bad_ident, bad_pw in [('noura_k', 'WrongPass!'), ('unknown@fresh.sa', 'NouraPass#2026')]:
+            with self.assertRaises(AuthenticationBoundaryError) as ctx:
+                login_with_credentials_sqlite(self.conn, bad_ident, bad_pw)
+            self.assertEqual(str(ctx.exception), GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    def test_07_refresh_token_rotation_and_08_replay_reuse_detection_revokes_family(self):
+        from apps.orders.auth import (
+            authenticate_access_token_sqlite,
+            register_customer_account,
+            rotate_session_token_sqlite,
+        )
+
+        reg = register_customer_account(
+            {
+                'full_name': 'ماجد الشمري',
+                'email': 'majed@fresh.sa',
+                'phone_number': '0591112233',
+                'password': 'MajedPass#2026',
+            },
+            conn=self.conn,
+        )
+        access_1 = reg['access_token']
+        refresh_1 = reg['refresh_token']
+
+        # Rotate refresh_1 -> produces access_2 and refresh_2
+        rotated = rotate_session_token_sqlite(self.conn, refresh_1)
+        access_2 = rotated['access_token']
+        refresh_2 = rotated['refresh_token']
+        self.assertNotEqual(access_1, access_2)
+        self.assertNotEqual(refresh_1, refresh_2)
+
+        # Old access_1 is immediately revoked and rejected
+        with self.assertRaises(AuthenticationBoundaryError):
+            authenticate_access_token_sqlite(self.conn, access_1)
+
+        # New access_2 is active
+        me_2 = authenticate_access_token_sqlite(self.conn, access_2)
+        self.assertEqual(me_2['email'], 'majed@fresh.sa')
+
+        # Replaying refresh_1 triggers REUSE_DETECTED and revokes access_2 & refresh_2!
+        with self.assertRaises(AuthenticationBoundaryError):
+            rotate_session_token_sqlite(self.conn, refresh_1)
+
+        with self.assertRaises(AuthenticationBoundaryError):
+            authenticate_access_token_sqlite(self.conn, access_2)
+
+        with self.assertRaises(AuthenticationBoundaryError):
+            rotate_session_token_sqlite(self.conn, refresh_2)
+
+        reasons = [
+            r[0]
+            for r in self.conn.execute(
+                'SELECT revocation_reason FROM orders_authsessiontoken ORDER BY id'
+            ).fetchall()
+        ]
+        self.assertEqual(reasons, ['ROTATED', 'REUSE_DETECTED'])
+
+    def test_09_logout_immediately_revokes_access_and_refresh_tokens(self):
+        from apps.orders.auth import (
+            authenticate_access_token_sqlite,
+            register_customer_account,
+            revoke_token_session_sqlite,
+            rotate_session_token_sqlite,
+        )
+
+        reg = register_customer_account(
+            {
+                'full_name': 'ريم السبيعي',
+                'email': 'reem@fresh.sa',
+                'phone_number': '0581234567',
+                'password': 'ReemPass#2026',
+            },
+            conn=self.conn,
+        )
+        access_tok = reg['access_token']
+        refresh_tok = reg['refresh_token']
+
+        self.assertEqual(
+            authenticate_access_token_sqlite(self.conn, access_tok)['email'],
+            'reem@fresh.sa',
+        )
+
+        revoke_token_session_sqlite(self.conn, access_tok)
+
+        with self.assertRaises(AuthenticationBoundaryError):
+            authenticate_access_token_sqlite(self.conn, access_tok)
+
+        with self.assertRaises(AuthenticationBoundaryError):
+            rotate_session_token_sqlite(self.conn, refresh_tok)
+
+    def test_10_rate_limiting_enforced_on_repeated_failed_logins_and_refreshes(self):
+        from apps.orders.auth import (
+            login_with_credentials_sqlite,
+            register_customer_account,
+            rotate_session_token_sqlite,
+            settings,
+        )
+        from middleware.auth_rate_limit import HttpRequest
+
+        register_customer_account(
+            {
+                'full_name': 'ياسر الزهراني',
+                'email': 'yasser@fresh.sa',
+                'phone_number': '0571234567',
+                'password': 'YasserPass#2026',
+            },
+            conn=self.conn,
+        )
+
+        orig_max_fail = getattr(settings, 'AUTH_MAX_FAILED_LOGIN_ATTEMPTS', 5)
+        orig_ref_limit = getattr(settings, 'AUTH_REFRESH_RATE_LIMIT_REQUESTS', 10)
+        try:
+            settings.AUTH_MAX_FAILED_LOGIN_ATTEMPTS = 3
+            settings.AUTH_REFRESH_RATE_LIMIT_REQUESTS = 2
+
+            for _ in range(3):
+                req = HttpRequest(
+                    method='POST',
+                    path='/api/v1/auth/login/',
+                    meta={'REMOTE_ADDR': '203.0.113.77'},
+                    body=json.dumps({'username': 'yasser@fresh.sa'}).encode('utf-8'),
+                )
+                with self.assertRaises(AuthenticationBoundaryError):
+                    login_with_credentials_sqlite(
+                        self.conn,
+                        'yasser@fresh.sa',
+                        'WrongPassword!',
+                        request=req,
+                    )
+
+            # 4th attempt is throttled even with valid password
+            req_throttled = HttpRequest(
+                method='POST',
+                path='/api/v1/auth/login/',
+                meta={'REMOTE_ADDR': '203.0.113.77'},
+                body=json.dumps({'username': 'yasser@fresh.sa'}).encode('utf-8'),
+            )
+            with self.assertRaises(AuthenticationBoundaryError) as ctx_rl:
+                login_with_credentials_sqlite(
+                    self.conn,
+                    'yasser@fresh.sa',
+                    'YasserPass#2026',
+                    request=req_throttled,
+                )
+            self.assertIn('throttled', str(ctx_rl.exception).lower())
+
+            # Refresh rate limit after 2 requests
+            for _ in range(2):
+                ref_req = HttpRequest(
+                    method='POST',
+                    path='/api/v1/auth/refresh/',
+                    meta={'REMOTE_ADDR': '203.0.113.88'},
+                )
+                with self.assertRaises(AuthenticationBoundaryError):
+                    rotate_session_token_sqlite(self.conn, 'invalid.jwt.token', request=ref_req)
+
+            ref_req_throttled = HttpRequest(
+                method='POST',
+                path='/api/v1/auth/refresh/',
+                meta={'REMOTE_ADDR': '203.0.113.88'},
+            )
+            with self.assertRaises(AuthenticationBoundaryError) as ctx_ref:
+                rotate_session_token_sqlite(
+                    self.conn,
+                    'invalid.jwt.token',
+                    request=ref_req_throttled,
+                )
+            self.assertIn('throttled', str(ctx_ref.exception).lower())
+
+            # Registration rate limit enforced when AUTH_LOGIN_RATE_LIMIT_REQUESTS is exceeded
+            orig_login_req_limit = getattr(settings, 'AUTH_LOGIN_RATE_LIMIT_REQUESTS', 15)
+            try:
+                settings.AUTH_LOGIN_RATE_LIMIT_REQUESTS = 2
+                for idx in range(2):
+                    reg_req = HttpRequest(
+                        method='POST',
+                        path='/api/v1/auth/register/',
+                        meta={'REMOTE_ADDR': '203.0.113.99'},
+                    )
+                    register_customer_account(
+                        {
+                            'full_name': f'عميل التسجيل {idx}',
+                            'email': f'reg_rl_{idx}@fresh.sa',
+                            'phone_number': f'056000001{idx}',
+                            'password': 'RegLimitPass#2026',
+                        },
+                        request=reg_req,
+                        conn=self.conn,
+                    )
+                reg_req_throttled = HttpRequest(
+                    method='POST',
+                    path='/api/v1/auth/register/',
+                    meta={'REMOTE_ADDR': '203.0.113.99'},
+                )
+                with self.assertRaises(AuthenticationBoundaryError) as ctx_reg_rl:
+                    register_customer_account(
+                        {
+                            'full_name': 'عميل التسجيل المرفوض',
+                            'email': 'reg_rl_blocked@fresh.sa',
+                            'phone_number': '0560000019',
+                            'password': 'RegLimitPass#2026',
+                        },
+                        request=reg_req_throttled,
+                        conn=self.conn,
+                    )
+                self.assertIn('throttled', str(ctx_reg_rl.exception).lower())
+            finally:
+                settings.AUTH_LOGIN_RATE_LIMIT_REQUESTS = orig_login_req_limit
+        finally:
+            settings.AUTH_MAX_FAILED_LOGIN_ATTEMPTS = orig_max_fail
+            settings.AUTH_REFRESH_RATE_LIMIT_REQUESTS = orig_ref_limit
+
+
+class MicroTask1D2AtomicCheckoutEngineTests(unittest.TestCase):
+    """
+    Microtask 1D.2 — Atomic Server-Side Checkout Engine Verification Suite.
+    Verifies all 16 mandatory checkout, pricing, spoofing, idempotency, concurrency,
+    rollback, ledger, tenant isolation, and snapshot immutability scenarios across
+    both the domain service layer and live HTTP `POST /api/v1/orders/` endpoint.
+    """
+
+    def setUp(self):
+        from apps.orders.auth import (
+            cache,
+            clear_rate_limit_cache,
+            ensure_sqlite_auth_schema,
+        )
+
+        clear_rate_limit_cache()
+        cache.clear()
+        self.conn = sqlite3.connect(':memory:')
+        create_full_sqlite_schema(self.conn)
+        ensure_sqlite_auth_schema(self.conn)
+
+        # Store 1: Fresh KSA (Branches 1 & 2)
+        self.conn.execute(
+            "INSERT INTO products_store (id, code, name, is_active) VALUES (1, 'FRESH-KSA', 'فريش السعودية', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (1, 1, 'RUH-01', 'فرع الرياض العليا', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (2, 1, 'JED-01', 'فرع جدة التحلية', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (1, 1, 'WH-RUH-01', 'مستودع الرياض 1', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (2, 2, 'WH-JED-01', 'مستودع جدة 1', 1, 1)"
+        )
+
+        # Store 2: Another isolated tenant store (Branch 3, Warehouse 3)
+        self.conn.execute(
+            "INSERT INTO products_store (id, code, name, is_active) VALUES (2, 'OTHER-STORE', 'متجر آخر مستقل', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (3, 2, 'DMM-01', 'فرع الدمام للمتجر الآخر', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (3, 3, 'WH-DMM-01', 'مستودع الدمام', 1, 1)"
+        )
+
+        # Categories
+        self.conn.execute(
+            "INSERT INTO products_category (id, name, display_order, is_active) VALUES (1, 'خضروات وفواكه', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_category (id, name, display_order, is_active) VALUES (2, 'فئة غير نشطة', 2, 0)"
+        )
+
+        # Product 1: Fractional cucumber (650 halalas / kg)
+        self.conn.execute(
+            """
+            INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active)
+            VALUES (1, 'SKU-1D2-CUC', 'خيار بلدي طازج', 1, 650, 'كجم', 1, 1)
+            """
+        )
+        # Product 2: Non-fractional olive oil (2400 halalas / bottle)
+        self.conn.execute(
+            """
+            INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active)
+            VALUES (2, 'SKU-1D2-OIL', 'زيت زيتون الجوف', 1, 2400, 'عبوة', 0, 1)
+            """
+        )
+        # Product 3: Fractional tomato with branch override in Branch 1 (base 800, override 720 in Branch 1)
+        self.conn.execute(
+            """
+            INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active)
+            VALUES (3, 'SKU-1D2-TOM', 'طماطم محمية', 1, 800, 'كجم', 1, 1)
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO products_branchproductoverride (branch_id, product_id, override_price_halalas, is_available, min_order_quantity_milli, max_order_quantity_milli)
+            VALUES (1, 3, 720, 1, 500, 5000)
+            """
+        )
+        # Product 4: Inactive product
+        self.conn.execute(
+            """
+            INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active)
+            VALUES (4, 'SKU-1D2-INACTIVE', 'منتج متوقف', 1, 500, 'حبة', 0, 0)
+            """
+        )
+        # Product 5: Active product but marked unavailable in Branch 1 via BranchProductOverride
+        self.conn.execute(
+            """
+            INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active)
+            VALUES (5, 'SKU-1D2-UNAVAIL', 'فراولة مستوردة', 1, 1500, 'علبة', 0, 1)
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO products_branchproductoverride (branch_id, product_id, override_price_halalas, is_available, min_order_quantity_milli)
+            VALUES (1, 5, NULL, 0, 1000)
+            """
+        )
+
+        # Stock balances in Warehouse 1 (Branch 1)
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 1, 10000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 2, 5000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 3, 8000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 4, 5000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 5, 5000, 0, 1)"
+        )
+        # Stock balance in Warehouse 2 (Branch 2) & Warehouse 3 (Branch 3 / Store 2)
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (2, 1, 10000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (3, 1, 10000, 0, 1)"
+        )
+
+        self.customer_actor = ServiceActor(
+            actor_id='user:101',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-user-101',
+        )
+        self.customer_actor_2 = ServiceActor(
+            actor_id='user:102',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-user-102',
+        )
+
+    def tearDown(self):
+        from apps.orders.auth import cache, clear_rate_limit_cache
+
+        self.conn.close()
+        clear_rate_limit_cache()
+        cache.clear()
+
+    def test_01_valid_order_creation_and_pending_status_history(self):
+        result = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[
+                {'product_id': 1, 'quantity_milli': 2000},  # 2 kg * 650 = 1300
+                {'product_id': 2, 'quantity_milli': 1000},  # 1 bottle * 2400 = 2400
+            ],
+            idempotency_key='idem-1d2-valid-01',
+            conn=self.conn,
+        )
+        self.assertFalse(result.replayed)
+        self.assertEqual(result.status, ORDER_STATUS_PENDING)
+        self.assertEqual(result.customer_id, 'cust-user-101')
+        self.assertEqual(result.branch_id, 1)
+        self.assertEqual(result.warehouse_id, 1)
+        self.assertEqual(result.total_halalas, 3700)
+        self.assertEqual(len(result.items), 2)
+
+        hist = self.conn.execute(
+            "SELECT from_status, to_status, changed_by_actor_id FROM orders_orderstatushistory WHERE order_id = ?",
+            (result.order_id,),
+        ).fetchall()
+        self.assertEqual(hist, [(None, 'PENDING', 'user:101')])
+
+    def test_02_server_side_price_calculation_with_branch_override_and_half_up_rounding(self):
+        # Product 1: 1250 milli * 650 halalas = (812500 + 500) // 1000 = 813 halalas
+        # Product 3: Branch 1 override price = 720 halalas (base is 800); 1500 milli * 720 = 1080 halalas
+        result = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[
+                {'product_id': 1, 'quantity_milli': 1250},
+                {'product_id': 3, 'quantity_milli': 1500},
+            ],
+            idempotency_key='idem-1d2-pricing-02',
+            conn=self.conn,
+        )
+        self.assertEqual(result.items[0].unit_price_halalas, 650)
+        self.assertEqual(result.items[0].line_total_halalas, 813)
+        self.assertEqual(result.items[1].unit_price_halalas, 720)
+        self.assertEqual(result.items[1].line_total_halalas, 1080)
+        self.assertEqual(result.total_halalas, 1893)
+
+    def test_03_rejection_and_ignoring_of_spoofed_client_unit_price(self):
+        from apps.orders.services import SpoofedFinancialDataError
+
+        # 1. Forbidden price override fields are strictly rejected with SpoofedFinancialDataError (400)
+        for bad_field in ('effective_price_halalas', 'override_price_halalas', 'price', 'unit_price'):
+            with self.subTest(bad_field=bad_field):
+                with self.assertRaises(SpoofedFinancialDataError):
+                    checkout_order(
+                        actor=self.customer_actor,
+                        branch_id=1,
+                        items=[{'product_id': 1, 'quantity_milli': 1000, bad_field: 10}],
+                        idempotency_key=f'idem-1d2-bad-price-{bad_field}',
+                        conn=self.conn,
+                    )
+
+        # 2. Negative or non-integer unit_price_halalas is strictly rejected
+        for invalid_val in (-100, '650', 6.5, True):
+            with self.assertRaises(SpoofedFinancialDataError):
+                checkout_order(
+                    actor=self.customer_actor,
+                    branch_id=1,
+                    items=[{'product_id': 1, 'quantity_milli': 1000, 'unit_price_halalas': invalid_val}],
+                    idempotency_key='idem-1d2-neg-price',
+                    conn=self.conn,
+                )
+
+        # 3. Mismatched expected_unit_price_halalas or reject_client_pricing=True is rejected
+        with self.assertRaises(SpoofedFinancialDataError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 1000, 'expected_unit_price_halalas': 100}],
+                idempotency_key='idem-1d2-mismatch-exp-unit',
+                conn=self.conn,
+            )
+        with self.assertRaises(SpoofedFinancialDataError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 1000, 'unit_price_halalas': 100}],
+                idempotency_key='idem-1d2-strict-unit',
+                reject_client_pricing=True,
+                conn=self.conn,
+            )
+
+        # 4. When standard unit_price_halalas is passed without reject_client_pricing, server ignores it and charges 650
+        res = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000, 'unit_price_halalas': 1}],
+            idempotency_key='idem-1d2-ignore-unit-price',
+            conn=self.conn,
+        )
+        self.assertEqual(res.items[0].unit_price_halalas, 650)
+        self.assertEqual(res.total_halalas, 650)
+
+    def test_04_rejection_and_ignoring_of_spoofed_client_total(self):
+        from apps.orders.services import SpoofedFinancialDataError
+
+        # 1. Negative or non-integer client_total_halalas or line_total_halalas rejected
+        with self.assertRaises(SpoofedFinancialDataError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-neg-total',
+                client_total_halalas=-50,
+                conn=self.conn,
+            )
+        with self.assertRaises(SpoofedFinancialDataError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 1000, 'line_total_halalas': -10}],
+                idempotency_key='idem-1d2-neg-line-total',
+                conn=self.conn,
+            )
+
+        # 2. Mismatched expected_total_halalas or reject_client_pricing=True rejected
+        with self.assertRaises(SpoofedFinancialDataError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-exp-total-mismatch',
+                expected_total_halalas=100,
+                conn=self.conn,
+            )
+        with self.assertRaises(SpoofedFinancialDataError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-reject-total',
+                client_total_halalas=100,
+                reject_client_pricing=True,
+                conn=self.conn,
+            )
+
+        # 3. Positive client_total_halalas is ignored in default mode; server records authoritative 650
+        res = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d2-ignore-total',
+            client_total_halalas=1,
+            conn=self.conn,
+        )
+        self.assertEqual(res.total_halalas, 650)
+
+    def test_05_rejection_of_zero_negative_fractional_or_duplicate_quantities(self):
+        for bad_qty in (0, -1, -1000, '1000', 1000.0, False):
+            with self.subTest(bad_qty=bad_qty):
+                with self.assertRaises(CheckoutValidationError):
+                    checkout_order(
+                        actor=self.customer_actor,
+                        branch_id=1,
+                        items=[{'product_id': 1, 'quantity_milli': bad_qty}],
+                        idempotency_key='idem-1d2-bad-qty',
+                        conn=self.conn,
+                    )
+
+        # Non-fractional product (product_id=2) rejects 1500 milli (1.5 units)
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 2, 'quantity_milli': 1500}],
+                idempotency_key='idem-1d2-non-fractional',
+                conn=self.conn,
+            )
+
+        # Duplicate product_id in the same order is rejected
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[
+                    {'product_id': 1, 'quantity_milli': 1000},
+                    {'product_id': 1, 'quantity_milli': 1000},
+                ],
+                idempotency_key='idem-1d2-dup-product',
+                conn=self.conn,
+            )
+
+    def test_06_rejection_of_inactive_product(self):
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 4, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-inactive-prod',
+                conn=self.conn,
+            )
+
+    def test_07_rejection_of_product_unavailable_in_branch_or_violating_min_max_bounds(self):
+        # Product 5 has BranchProductOverride(is_available=False) in Branch 1
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 5, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-branch-unavail',
+                conn=self.conn,
+            )
+
+        # Product 3 in Branch 1 has min_order_quantity_milli=500, max_order_quantity_milli=5000
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 3, 'quantity_milli': 250}],
+                idempotency_key='idem-1d2-below-min',
+                conn=self.conn,
+            )
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 3, 'quantity_milli': 6000}],
+                idempotency_key='idem-1d2-above-max',
+                conn=self.conn,
+            )
+
+    def test_08_rejection_of_insufficient_stock_and_09_prevention_of_negative_stock(self):
+        # Product 2 has on_hand_milli=5000. Reserve 2000 milli so available is 3000 milli.
+        self.conn.execute(
+            "UPDATE products_warehousestockbalance SET reserved_milli = 2000 WHERE warehouse_id = 1 AND product_id = 2"
+        )
+        with self.assertRaises(InsufficientStockError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[
+                    {'product_id': 1, 'quantity_milli': 1000},
+                    {'product_id': 2, 'quantity_milli': 4000},  # exceeds available 3000
+                ],
+                idempotency_key='idem-1d2-insufficient',
+                conn=self.conn,
+            )
+
+        # Verify Product 1 was NOT deducted either (atomic rollback) and on_hand_milli >= reserved_milli >= 0
+        b1 = self.conn.execute(
+            "SELECT on_hand_milli, reserved_milli, version FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+        ).fetchone()
+        b2 = self.conn.execute(
+            "SELECT on_hand_milli, reserved_milli, version FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 2"
+        ).fetchone()
+        self.assertEqual(b1, (10000, 0, 1))
+        self.assertEqual(b2, (5000, 2000, 1))
+        self.assertGreaterEqual(b2[0], 0)
+        self.assertGreaterEqual(b2[0], b2[1])
+
+    def test_10_idempotency_replay_prevents_duplicate_order_and_isolates_customers(self):
+        first = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 2000}],
+            idempotency_key='idem-1d2-shared-key',
+            conn=self.conn,
+        )
+        self.assertFalse(first.replayed)
+
+        replay = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 2000}],
+            idempotency_key='idem-1d2-shared-key',
+            conn=self.conn,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.order_id, first.order_id)
+
+        # Stock was deducted only once (10000 -> 8000)
+        on_hand = self.conn.execute(
+            "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(on_hand, 8000)
+
+        # A DIFFERENT customer (customer_actor_2) using the exact same idempotency_key string
+        # is scoped to their own customer_id/actor_id and creates their own independent order
+        second_cust_order = checkout_order(
+            actor=self.customer_actor_2,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d2-shared-key',
+            conn=self.conn,
+        )
+        self.assertFalse(second_cust_order.replayed)
+        self.assertNotEqual(second_cust_order.order_id, first.order_id)
+        self.assertEqual(second_cust_order.customer_id, 'cust-user-102')
+
+    def test_11_idempotency_key_reused_with_different_payload_rejected_with_conflict(self):
+        checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d2-conflict-key',
+            conn=self.conn,
+        )
+        with self.assertRaises(IdempotencyConflictError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 2000}],
+                idempotency_key='idem-1d2-conflict-key',
+                conn=self.conn,
+            )
+
+    def test_12_two_concurrent_orders_competing_for_last_stock_unit(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        from apps.orders.test_http_server import FreshContractHttpServer
+
+        server = FreshContractHttpServer()
+        port = server.start_in_background()
+        try:
+            # Set Product 1 stock in Warehouse 1 to exactly 1000 milli (1 kg)
+            with server.lock:
+                server.conn.execute(
+                    "UPDATE products_warehousestockbalance SET on_hand_milli = 1000, reserved_milli = 0 WHERE warehouse_id = 1 AND product_id = 1"
+                )
+                server.conn.commit()
+
+            def register_and_get_token(idx: int) -> str:
+                req = urllib.request.Request(
+                    f'http://127.0.0.1:{port}/api/v1/auth/register/',
+                    data=json.dumps(
+                        {
+                            'full_name': f'عميل متزامن {idx}',
+                            'email': f'concurrent_{idx}@fresh.sa',
+                            'phone_number': f'055777000{idx}',
+                            'password': 'Concurrent#2026',
+                        }
+                    ).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST',
+                )
+                with urllib.request.urlopen(req) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+                    return body['access_token']
+
+            token_1 = register_and_get_token(1)
+            token_2 = register_and_get_token(2)
+
+            barrier = threading.Barrier(2)
+            outcomes: list[tuple[int, dict]] = []
+            outcomes_lock = threading.Lock()
+
+            def place_competing_order(token: str, idem: str) -> None:
+                req = urllib.request.Request(
+                    f'http://127.0.0.1:{port}/api/v1/orders/',
+                    data=json.dumps(
+                        {
+                            'branch_id': 1,
+                            'idempotency_key': idem,
+                            'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                        }
+                    ).encode('utf-8'),
+                    headers={
+                        'Content-Type': 'application/json',
+                        'Authorization': f'Bearer {token}',
+                        'Idempotency-Key': idem,
+                    },
+                    method='POST',
+                )
+                barrier.wait()
+                try:
+                    with urllib.request.urlopen(req) as resp:
+                        status_code = resp.status
+                        payload = json.loads(resp.read().decode('utf-8'))
+                except urllib.error.HTTPError as err:
+                    status_code = err.code
+                    payload = json.loads(err.read().decode('utf-8'))
+                with outcomes_lock:
+                    outcomes.append((status_code, payload))
+
+            t1 = threading.Thread(target=place_competing_order, args=(token_1, 'idem-race-1'))
+            t2 = threading.Thread(target=place_competing_order, args=(token_2, 'idem-race-2'))
+            t1.start()
+            t2.start()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+            statuses = sorted(s for s, _ in outcomes)
+            # Exactly one request succeeds (201 Created) and one is rejected (409 Conflict)
+            self.assertEqual(statuses, [201, 409], outcomes)
+
+            with server.lock:
+                bal = server.conn.execute(
+                    "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+                ).fetchone()[0]
+                order_count = server.conn.execute("SELECT COUNT(*) FROM orders_order").fetchone()[0]
+                movement_count = server.conn.execute(
+                    "SELECT COUNT(*) FROM products_stockmovement WHERE movement_type = 'CHECKOUT_DEDUCTION'"
+                ).fetchone()[0]
+
+            self.assertEqual(bal, 0)
+            self.assertEqual(order_count, 1)
+            self.assertEqual(movement_count, 1)
+        finally:
+            server.stop()
+
+    def test_13_full_atomic_rollback_if_stock_movement_creation_fails(self):
+        # Install a temporary BEFORE INSERT trigger on products_stockmovement that aborts
+        # when product_id = 2 so the checkout fails mid-transaction AFTER Order, OrderItem,
+        # OrderStatusHistory, and WarehouseStockBalance updates have already run.
+        self.conn.execute(
+            """
+            CREATE TRIGGER trg_test_fail_stock_movement_on_product_2
+            BEFORE INSERT ON products_stockmovement
+            WHEN NEW.product_id = 2
+            BEGIN
+                SELECT RAISE(ABORT, 'Simulated StockMovement write failure on product 2');
+            END;
+            """
+        )
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                checkout_order(
+                    actor=self.customer_actor,
+                    branch_id=1,
+                    items=[
+                        {'product_id': 1, 'quantity_milli': 1000},
+                        {'product_id': 2, 'quantity_milli': 1000},
+                    ],
+                    idempotency_key='idem-1d2-mid-tx-rollback',
+                    conn=self.conn,
+                )
+        finally:
+            self.conn.execute("DROP TRIGGER IF EXISTS trg_test_fail_stock_movement_on_product_2")
+
+        # Verify 100% atomic rollback: zero orders, zero items, zero history, zero movements, zero idempotency records, and untouched stock balances
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders_order").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders_orderitem").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders_orderstatushistory").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM products_stockmovement").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders_idempotencykey").fetchone()[0], 0)
+
+        bal_1 = self.conn.execute(
+            "SELECT on_hand_milli, version FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+        ).fetchone()
+        bal_2 = self.conn.execute(
+            "SELECT on_hand_milli, version FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 2"
+        ).fetchone()
+        self.assertEqual(bal_1, (10000, 1))
+        self.assertEqual(bal_2, (5000, 1))
+
+    def test_14_stock_movement_ledger_matches_stock_deduction_and_reference_order(self):
+        result = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[
+                {'product_id': 1, 'quantity_milli': 2500},
+                {'product_id': 2, 'quantity_milli': 2000},
+            ],
+            idempotency_key='idem-1d2-ledger-match',
+            conn=self.conn,
+        )
+
+        movements = self.conn.execute(
+            """
+            SELECT product_id, movement_type, quantity_delta_milli, balance_after_milli,
+                   reference_order_id, actor_id, idempotency_key
+            FROM products_stockmovement
+            WHERE reference_order_id = ?
+            ORDER BY product_id ASC
+            """,
+            (result.order_id,),
+        ).fetchall()
+        self.assertEqual(
+            movements,
+            [
+                (
+                    1,
+                    'CHECKOUT_DEDUCTION',
+                    -2500,
+                    7500,
+                    result.order_id,
+                    'user:101',
+                    f'checkout:order-{result.order_id}:item-{result.items[0].id}',
+                ),
+                (
+                    2,
+                    'CHECKOUT_DEDUCTION',
+                    -2000,
+                    3000,
+                    result.order_id,
+                    'user:101',
+                    f'checkout:order-{result.order_id}:item-{result.items[1].id}',
+                ),
+            ],
+        )
+
+        # Verify balance_after_milli in StockMovement equals current WarehouseStockBalance.on_hand_milli
+        for prod_id, _, delta_milli, bal_after, _, _, _ in movements:
+            actual_on_hand = self.conn.execute(
+                "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = ?",
+                (prod_id,),
+            ).fetchone()[0]
+            self.assertEqual(bal_after, actual_on_hand)
+            self.assertLess(delta_milli, 0)
+
+    def test_15_cross_branch_warehouse_and_cross_store_isolation_and_spoofing_protection(self):
+        # 1. Requesting Branch 1 with Warehouse 2 (which belongs to Branch 2) or Warehouse 3 (Store 2) is rejected
+        with self.assertRaises(BranchWarehouseMismatchError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                warehouse_id=2,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-wh-mismatch-1',
+                conn=self.conn,
+            )
+        with self.assertRaises(BranchWarehouseMismatchError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                warehouse_id=3,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-wh-mismatch-2',
+                conn=self.conn,
+            )
+
+        # 2. Store-bound customer (store_id=1) attempting to checkout from Branch 3 (Store 2) is rejected with AuthenticationBoundaryError (403)
+        store_1_customer = ServiceActor(
+            actor_id='user:101',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-user-101',
+            store_id=1,
+        )
+        with self.assertRaises(AuthenticationBoundaryError):
+            checkout_order(
+                actor=store_1_customer,
+                branch_id=3,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d2-cross-store',
+                conn=self.conn,
+            )
+
+        # 3. Non-CUSTOMER role (OWNER / BRANCH_MANAGER) attempting customer checkout is rejected with AuthenticationBoundaryError (403)
+        for staff_role in (ActorRole.OWNER.value, ActorRole.BRANCH_MANAGER.value):
+            staff_actor = ServiceActor(
+                actor_id='user:900',
+                role=staff_role,
+                customer_id='cust-staff-900',
+                store_id=1,
+                authorized_branch_ids=frozenset({1}),
+            )
+            with self.assertRaises(AuthenticationBoundaryError):
+                checkout_order(
+                    actor=staff_actor,
+                    branch_id=1,
+                    items=[{'product_id': 1, 'quantity_milli': 1000}],
+                    idempotency_key=f'idem-1d2-staff-{staff_role}',
+                    conn=self.conn,
+                )
+
+        # 4. Spoofed stock manipulation fields in item payload are rejected
+        for stock_field in ('stock_quantity', 'on_hand_milli', 'reserved_milli', 'available_milli'):
+            with self.assertRaises(CheckoutValidationError):
+                checkout_order(
+                    actor=self.customer_actor,
+                    branch_id=1,
+                    items=[{'product_id': 1, 'quantity_milli': 1000, stock_field: 999999}],
+                    idempotency_key=f'idem-1d2-spoof-{stock_field}',
+                    conn=self.conn,
+                )
+
+    def test_16_order_item_preserves_immutable_snapshots_after_catalog_mutation(self):
+        result = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 3, 'quantity_milli': 1500}],
+            idempotency_key='idem-1d2-snapshot-16',
+            conn=self.conn,
+        )
+        self.assertEqual(result.items[0].product_name_snapshot, 'طماطم محمية')
+        self.assertEqual(result.items[0].unit_snapshot, 'كجم')
+        self.assertEqual(result.items[0].unit_price_halalas, 720)
+        self.assertEqual(result.items[0].line_total_halalas, 1080)
+
+        # Mutate product name, unit, base price, and branch override price in the catalog
+        self.conn.execute(
+            "UPDATE products_product SET name = 'طماطم عضوية فاخرة', unit = 'صندوق', price_halalas = 3500 WHERE id = 3"
+        )
+        self.conn.execute(
+            "UPDATE products_branchproductoverride SET override_price_halalas = 3200 WHERE branch_id = 1 AND product_id = 3"
+        )
+
+        # Stored OrderItem snapshot remains completely unchanged
+        saved_item = self.conn.execute(
+            """
+            SELECT product_name_snapshot, unit_snapshot, quantity_milli, unit_price_halalas, line_total_halalas
+            FROM orders_orderitem
+            WHERE order_id = ?
+            """,
+            (result.order_id,),
+        ).fetchone()
+        self.assertEqual(saved_item, ('طماطم محمية', 'كجم', 1500, 720, 1080))
+
+        # Replaying the same idempotency key returns the original historical snapshot, not the new catalog price
+        replayed = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 3, 'quantity_milli': 1500}],
+            idempotency_key='idem-1d2-snapshot-16',
+            conn=self.conn,
+        )
+        self.assertTrue(replayed.replayed)
+        self.assertEqual(replayed.items[0].product_name_snapshot, 'طماطم محمية')
+        self.assertEqual(replayed.items[0].unit_snapshot, 'كجم')
+        self.assertEqual(replayed.items[0].unit_price_halalas, 720)
+        self.assertEqual(replayed.items[0].line_total_halalas, 1080)
+        self.assertEqual(replayed.total_halalas, 1080)
+
+    def test_17_http_contract_status_codes_on_post_api_v1_orders(self):
+        import urllib.error
+        import urllib.request
+        from apps.orders.test_http_server import FreshContractHttpServer
+
+        server = FreshContractHttpServer()
+        port = server.start_in_background()
+        try:
+            def http_json(method: str, path: str, body: dict | None = None, headers: dict | None = None) -> tuple[int, dict]:
+                req_headers = {'Content-Type': 'application/json'}
+                if headers:
+                    req_headers.update(headers)
+                raw = json.dumps(body).encode('utf-8') if body is not None else None
+                req = urllib.request.Request(
+                    f'http://127.0.0.1:{port}{path}',
+                    data=raw,
+                    headers=req_headers,
+                    method=method,
+                )
+                try:
+                    with urllib.request.urlopen(req) as resp:
+                        return resp.status, json.loads(resp.read().decode('utf-8'))
+                except urllib.error.HTTPError as err:
+                    return err.code, json.loads(err.read().decode('utf-8'))
+
+            # 1. Unauthenticated POST /api/v1/orders/ -> 401 Unauthorized
+            code_unauth, _ = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {'branch_id': 1, 'idempotency_key': 'k1', 'items': [{'product_id': 1, 'quantity_milli': 1000}]},
+            )
+            self.assertEqual(code_unauth, 401)
+
+            # 2. Register customer and obtain Bearer token
+            code_reg, reg_body = http_json(
+                'POST',
+                '/api/v1/auth/register/',
+                {
+                    'full_name': 'بندر العتيبي',
+                    'email': 'bandar.1d2@fresh.sa',
+                    'phone_number': '0501239999',
+                    'password': 'Bandar#2026!',
+                },
+            )
+            self.assertEqual(code_reg, 201)
+            auth_hdr = {'Authorization': f"Bearer {reg_body['access_token']}"}
+
+            # 3. Valid checkout -> 201 Created
+            code_create, order_body = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'http-idem-01',
+                    'items': [{'product_id': 1, 'quantity_milli': 2000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_create, 201)
+            self.assertFalse(order_body['replayed'])
+            self.assertEqual(order_body['total_halalas'], 1590)  # 2 * 795
+            self.assertEqual(order_body['status'], 'PENDING')
+
+            # 4. Idempotent replay -> 200 OK with replayed=True
+            code_replay, replay_body = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'http-idem-01',
+                    'items': [{'product_id': 1, 'quantity_milli': 2000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_replay, 200)
+            self.assertTrue(replay_body['replayed'])
+            self.assertEqual(replay_body['id'], order_body['id'])
+
+            # 5. Same idempotency_key with different payload -> 409 Conflict
+            code_conflict, _ = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'http-idem-01',
+                    'items': [{'product_id': 1, 'quantity_milli': 3000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_conflict, 409)
+
+            # 6. Non-existent product or branch -> 404 Not Found
+            code_404_prod, _ = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'http-idem-404-prod',
+                    'items': [{'product_id': 9999, 'quantity_milli': 1000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_404_prod, 404)
+
+            code_404_branch, _ = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {
+                    'branch_id': 9999,
+                    'idempotency_key': 'http-idem-404-branch',
+                    'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_404_branch, 404)
+
+            # 7. Spoofed user_id / customer_id / role -> 403 Forbidden
+            for spoof_field, spoof_val in [
+                ('customer_id', 'cust-other'),
+                ('user_id', 999),
+                ('role', 'OWNER'),
+                ('store_id', 2),
+            ]:
+                code_403, _ = http_json(
+                    'POST',
+                    '/api/v1/orders/',
+                    {
+                        'branch_id': 1,
+                        'idempotency_key': f'http-idem-403-{spoof_field}',
+                        spoof_field: spoof_val,
+                        'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                    },
+                    headers=auth_hdr,
+                )
+                self.assertEqual(code_403, 403, spoof_field)
+
+            # 8. Non-CUSTOMER role (OWNER) attempting checkout -> 403 Forbidden
+            code_owner_login, owner_login = http_json(
+                'POST',
+                '/api/v1/auth/login/',
+                {'username': 'owner@fresh.sa', 'password': 'OwnerPass123'},
+            )
+            self.assertEqual(code_owner_login, 200)
+            code_owner_checkout, _ = http_json(
+                'POST',
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'http-idem-owner',
+                    'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                },
+                headers={'Authorization': f"Bearer {owner_login['access_token']}"},
+            )
+            self.assertEqual(code_owner_checkout, 403)
+        finally:
+            server.stop()
+
 
 
 

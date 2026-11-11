@@ -330,89 +330,91 @@ fun LoginScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                if (com.example.BuildConfig.DEBUG) {
+                    Spacer(modifier = Modifier.height(20.dp))
 
-                // Explicitly Labeled Local Development / Demo Accounts Card
-                Surface(
-                    shape = RoundedCornerShape(18.dp),
-                    color = Color(0xFFFFFBEB),
-                    border = BorderStroke(1.dp, AccentOrange.copy(alpha = 0.5f)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("local_dev_demo_card")
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.Info,
-                                contentDescription = null,
-                                tint = AccentOrange,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
+                    // Explicitly Labeled Local Development / Demo Accounts Card (Debug Builds Only)
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        color = Color(0xFFFFFBEB),
+                        border = BorderStroke(1.dp, AccentOrange.copy(alpha = 0.5f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("local_dev_demo_card")
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.Info,
+                                    contentDescription = null,
+                                    tint = AccentOrange,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "وضع التطوير المحلي (Local Dev / Demo Only)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = TextDarkGreen,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "وضع التطوير المحلي (Local Dev / Demo Only)",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = TextDarkGreen,
-                                fontWeight = FontWeight.Bold
+                                text = "حسابات محاكاة محلية مخصصة لاختبار صلاحيات الأدوار (العميل، مالك المتجر، مشرف المتجر) بدون خادم إنتاج خلفي.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
                             )
-                        }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "حسابات محاكاة محلية مخصصة لاختبار صلاحيات الأدوار (العميل، مالك المتجر، مشرف المتجر) بدون خادم إنتاج خلفي.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary
-                        )
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                            Spacer(modifier = Modifier.height(12.dp))
 
-                        OutlinedButton(
-                            onClick = {
-                                viewModel.loginWithDemoRole(UserRole.CUSTOMER, onAuthenticated)
-                            },
-                            border = BorderStroke(1.dp, FreshGreen),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("demo_login_customer_button")
-                        ) {
-                            Icon(Icons.Default.Person, contentDescription = null, tint = FreshGreen, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("دخول تجريبي: عميل (Customer Demo)", color = FreshGreen, fontWeight = FontWeight.SemiBold)
-                        }
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.loginWithDemoRole(UserRole.CUSTOMER, onAuthenticated)
+                                },
+                                border = BorderStroke(1.dp, FreshGreen),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("demo_login_customer_button")
+                            ) {
+                                Icon(Icons.Default.Person, contentDescription = null, tint = FreshGreen, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("دخول تجريبي: عميل (Customer Demo)", color = FreshGreen, fontWeight = FontWeight.SemiBold)
+                            }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
 
-                        OutlinedButton(
-                            onClick = {
-                                viewModel.loginWithDemoRole(UserRole.STORE_OWNER, onAuthenticated)
-                            },
-                            border = BorderStroke(1.dp, FreshGreenDark),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("demo_login_owner_button")
-                        ) {
-                            Icon(Icons.Default.Storefront, contentDescription = null, tint = FreshGreenDark, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("دخول تجريبي: مالك المتجر (Owner Dev Demo)", color = FreshGreenDark, fontWeight = FontWeight.SemiBold)
-                        }
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.loginWithDemoRole(UserRole.STORE_OWNER, onAuthenticated)
+                                },
+                                border = BorderStroke(1.dp, FreshGreenDark),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("demo_login_owner_button")
+                            ) {
+                                Icon(Icons.Default.Storefront, contentDescription = null, tint = FreshGreenDark, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("دخول تجريبي: مالك المتجر (Owner Dev Demo)", color = FreshGreenDark, fontWeight = FontWeight.SemiBold)
+                            }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
 
-                        OutlinedButton(
-                            onClick = {
-                                viewModel.loginWithDemoRole(UserRole.STORE_ADMIN, onAuthenticated)
-                            },
-                            border = BorderStroke(1.dp, FreshGreenDark),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("demo_login_admin_button")
-                        ) {
-                            Icon(Icons.Default.AdminPanelSettings, contentDescription = null, tint = FreshGreenDark, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("دخول تجريبي: مشرف المتجر (Admin Dev Demo)", color = FreshGreenDark, fontWeight = FontWeight.SemiBold)
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.loginWithDemoRole(UserRole.STORE_ADMIN, onAuthenticated)
+                                },
+                                border = BorderStroke(1.dp, FreshGreenDark),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("demo_login_admin_button")
+                            ) {
+                                Icon(Icons.Default.AdminPanelSettings, contentDescription = null, tint = FreshGreenDark, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("دخول تجريبي: مشرف المتجر (Admin Dev Demo)", color = FreshGreenDark, fontWeight = FontWeight.SemiBold)
+                            }
                         }
                     }
                 }

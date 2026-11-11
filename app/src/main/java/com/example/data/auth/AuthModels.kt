@@ -10,28 +10,42 @@ import java.security.MessageDigest
 enum class UserRole(
     val arabicTitle: String,
     val arabicDescription: String,
-    val canAccessStoreManagement: Boolean
+    val canAccessStoreManagement: Boolean,
+    val serverRoleCode: String
 ) {
     CUSTOMER(
         arabicTitle = "عميل",
         arabicDescription = "تسوق المنتجات الطازجة وإدارة السلة والطلبات",
-        canAccessStoreManagement = false
+        canAccessStoreManagement = false,
+        serverRoleCode = "CUSTOMER"
     ),
     STORE_OWNER(
         arabicTitle = "مالك المتجر",
         arabicDescription = "إدارة المتجر والمنتجات والمخزون والتسعير",
-        canAccessStoreManagement = true
+        canAccessStoreManagement = true,
+        serverRoleCode = "OWNER"
     ),
     STORE_ADMIN(
         arabicTitle = "مشرف المتجر",
         arabicDescription = "إدارة عمليات المتجر والمنتجات وصلاحيات التشغيل",
-        canAccessStoreManagement = true
-    )
+        canAccessStoreManagement = true,
+        serverRoleCode = "BRANCH_MANAGER"
+    );
+
+    companion object {
+        fun fromServerRole(serverRole: String?): UserRole {
+            return when (serverRole?.trim()?.uppercase()) {
+                "OWNER", "STORE_OWNER" -> STORE_OWNER
+                "BRANCH_MANAGER", "STORE_ADMIN" -> STORE_ADMIN
+                else -> CUSTOMER
+            }
+        }
+    }
 }
 
 /**
  * Represents an authenticated user session.
- * Note: Passwords or password hashes are never included in the session model.
+ * Note: Passwords, password hashes, and raw JWT tokens are never included in the session model.
  */
 data class AuthenticatedUser(
     val id: String,
@@ -39,7 +53,10 @@ data class AuthenticatedUser(
     val email: String,
     val phoneNumber: String,
     val role: UserRole,
-    val isLocalDemoAccount: Boolean
+    val isLocalDemoAccount: Boolean,
+    val customerId: String? = null,
+    val authorizedBranchIds: List<Int>? = null,
+    val hasActiveRemoteJwtSession: Boolean = false
 )
 
 /**

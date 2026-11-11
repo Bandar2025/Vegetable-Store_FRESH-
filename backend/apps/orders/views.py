@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 from .auth import (
     GENERIC_INVALID_CREDENTIALS_MESSAGE,
     GENERIC_INVALID_REFRESH_TOKEN_MESSAGE,
+    CustomerRegistrationValidationError,
     IssuedTokenPair,
     LoginRateThrottle,
     TokenRefreshRateThrottle,
@@ -17,6 +18,7 @@ from .auth import (
     enforce_auth_rate_limit,
     issue_session_token_pair,
     record_failed_login_attempt,
+    register_customer_account,
     resolve_service_actor_from_user,
     revoke_all_user_tokens,
     revoke_token_session,
@@ -31,23 +33,25 @@ from .permissions import (
 from .serializers import (
     AuthLoginRequestSerializer,
     AuthLogoutRequestSerializer,
+    AuthRegisterRequestSerializer,
     AuthTokenRefreshRequestSerializer,
     CancelOrderRequestSerializer,
     CheckoutRequestSerializer,
     OrderSerializer,
     OrderStatusTransitionRequestSerializer,
-)
 from .services import (
     ActorRole,
     AuthenticationBoundaryError,
     BranchWarehouseMismatchError,
     CheckoutItemInput,
+    CheckoutResourceNotFoundError,
     CheckoutValidationError,
     IdempotencyConflictError,
     InsufficientStockError,
     InvalidOrderStatusTransitionError,
     MissingStockBalanceError,
     OrderCancellationError,
+    SpoofedFinancialDataError,
     cancel_order,
     checkout_order,
     transition_order_status,
@@ -55,12 +59,18 @@ from .services import (
 
 
 def _extract_idempotency_key(request, serializer_data: dict) -> str:
-    key = (
-        serializer_data.get('idempotency_key')
-        or request.headers.get('Idempotency-Key')
+    body_key_raw = serializer_data.get('idempotency_key')
+    header_key_raw = (
+        request.headers.get('Idempotency-Key')
         or request.headers.get('X-Idempotency-Key')
     )
-    return key.strip() if isinstance(key, str) else ''
+    body_key = body_key_raw.strip() if isinstance(body_key_raw, str) else ''
+    header_key = header_key_raw.strip() if isinstance(header_key_raw, str) else ''
+    if body_key and header_key and body_key != header_key:
+        raise IdempotencyConflictError(
+            "Idempotency-Key header does not match body idempotency_key."
+        )
+    return body_key or header_key
 
 
 def _build_auth_token_response_payload(user, actor, token_pair: IssuedTokenPair) -> dict:
@@ -76,6 +86,9 @@ def _build_auth_token_response_payload(user, actor, token_pair: IssuedTokenPair)
         'refresh_expires_at': token_pair.refresh_expires_at.isoformat(),
         'actor_id': actor.actor_id,
         'username': user.username,
+        'email': getattr(user, 'email', '') or '',
+        'full_name': getattr(user, 'first_name', '') or user.username,
+        'phone_number': getattr(user, 'last_name', '') or '',
         'role': actor.role,
         'customer_id': actor.customer_id,
         'store_id': profile.store_id,
@@ -85,6 +98,42 @@ def _build_auth_token_response_payload(user, actor, token_pair: IssuedTokenPair)
             else None
         ),
     }
+
+
+class AuthRegisterView(APIView):
+    """
+    Public customer registration endpoint (`POST /api/v1/auth/register/`):
+    - Strictly creates `CUSTOMER` accounts only; rejects any attempt to supply `role`,
+      `actor_role`, `is_staff`, `is_superuser`, `branch_id`, `store_id`, or privileged roles
+      (`OWNER`, `BRANCH_MANAGER`, `ADMIN`).
+    - Validates `email`, `full_name`, `phone_number`, and `password` strength, and rejects
+      duplicate `username`, `email`, or `phone_number`.
+    - Hashes passwords with Django PBKDF2-SHA256, provisions `UserIdentityProfile(role='CUSTOMER')`,
+      and issues an initial HS256 JWT access + refresh token pair (`201 Created`).
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
+
+    @enforce_auth_rate_limit('login')
+    def post(self, request, *args, **kwargs):
+        raw_data = request.data if isinstance(request.data, dict) else {}
+        serializer = AuthRegisterRequestSerializer(
+            data=raw_data,
+            context={'request': request},
+        )
+        if not serializer.is_valid():
+            record_failed_login_attempt(request)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            payload = register_customer_account(raw_data, request=request)
+        except CustomerRegistrationValidationError as exc:
+            record_failed_login_attempt(request)
+            return Response(exc.errors, status=exc.status_code)
+
+        clear_failed_login_attempts(request, payload.get('username'))
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class AuthLoginView(APIView):
@@ -107,12 +156,19 @@ class AuthLoginView(APIView):
             record_failed_login_attempt(request)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        username = serializer.validated_data['username'].strip()
+        identifier = serializer.validated_data['username'].strip()
         password = serializer.validated_data['password']
 
         UserModel = get_user_model()
-        user_record = UserModel.objects.filter(username=username).first()
-        user = authenticate(request=request, username=username, password=password)
+        user_record = UserModel.objects.filter(username=identifier).first()
+        if user_record is None and '@' in identifier:
+            user_record = (
+                UserModel.objects.filter(email__iexact=identifier)
+                .order_by('id')
+                .first()
+            )
+        effective_username = user_record.username if user_record is not None else identifier
+        user = authenticate(request=request, username=effective_username, password=password)
 
         if user_record is not None and not user_record.is_active:
             revoke_all_user_tokens(
@@ -122,7 +178,7 @@ class AuthLoginView(APIView):
             )
 
         if user is None:
-            record_failed_login_attempt(request, username)
+            record_failed_login_attempt(request, identifier)
             return Response(
                 {'detail': GENERIC_INVALID_CREDENTIALS_MESSAGE},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -136,13 +192,13 @@ class AuthLoginView(APIView):
                 reason=AuthSessionToken.RevocationReason.ACCOUNT_INACTIVE,
                 request=request,
             )
-            record_failed_login_attempt(request, username)
+            record_failed_login_attempt(request, identifier)
             return Response(
                 {'detail': GENERIC_INVALID_CREDENTIALS_MESSAGE},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        clear_failed_login_attempts(request, username)
+        clear_failed_login_attempts(request, effective_username)
         token_pair = issue_session_token_pair(user)
         return Response(
             _build_auth_token_response_payload(user, actor, token_pair),
@@ -198,6 +254,9 @@ class AuthMeView(APIView):
             {
                 'actor_id': actor.actor_id,
                 'username': request.user.username,
+                'email': getattr(request.user, 'email', '') or '',
+                'full_name': getattr(request.user, 'first_name', '') or request.user.username,
+                'phone_number': getattr(request.user, 'last_name', '') or '',
                 'role': actor.role,
                 'customer_id': actor.customer_id,
                 'store_id': profile.store_id,
@@ -298,7 +357,10 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         actor = get_or_resolve_request_actor(request)
         if actor.role != ActorRole.CUSTOMER.value:
             return Response(
-                {'detail': 'Only authenticated CUSTOMER accounts may place checkout orders.'},
+                {
+                    'detail': 'Only authenticated CUSTOMER accounts may place checkout orders.',
+                    'code': 'authorization_denied',
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -306,10 +368,20 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         req_serializer.is_valid(raise_exception=True)
         validated = req_serializer.validated_data
 
-        idempotency_key = _extract_idempotency_key(request, validated)
+        try:
+            idempotency_key = _extract_idempotency_key(request, validated)
+        except IdempotencyConflictError as exc:
+            return Response(
+                {'detail': str(exc), 'code': 'idempotency_conflict'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         if not idempotency_key:
             return Response(
-                {'detail': 'idempotency_key is required (in body or Idempotency-Key header).'},
+                {
+                    'detail': 'idempotency_key is required (in body or Idempotency-Key header).',
+                    'code': 'validation_error',
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -319,6 +391,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
                 quantity_milli=item['quantity_milli'],
                 client_unit_price_halalas=item.get('unit_price_halalas', item.get('price_halalas')),
                 client_line_total_halalas=item.get('line_total_halalas'),
+                expected_unit_price_halalas=item.get('expected_unit_price_halalas'),
             )
             for item in validated['items']
         ]
@@ -332,18 +405,46 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
                 items=checkout_items,
                 idempotency_key=idempotency_key,
                 client_total_halalas=validated.get('total_halalas'),
+                expected_total_halalas=validated.get('expected_total_halalas'),
             )
         except AuthenticationBoundaryError as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
-        except IdempotencyConflictError as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
+            return Response(
+                {'detail': str(exc), 'code': 'authorization_denied'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except (IdempotencyConflictError, InsufficientStockError) as exc:
+            code = (
+                'insufficient_stock'
+                if isinstance(exc, InsufficientStockError)
+                else 'idempotency_conflict'
+            )
+            return Response(
+                {'detail': str(exc), 'code': code},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except CheckoutResourceNotFoundError as exc:
+            return Response(
+                {'detail': str(exc), 'code': 'not_found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         except (
-            InsufficientStockError,
+            SpoofedFinancialDataError,
             MissingStockBalanceError,
             BranchWarehouseMismatchError,
             CheckoutValidationError,
         ) as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'detail': str(exc), 'code': 'validation_error'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            return Response(
+                {
+                    'detail': 'An unexpected internal server error occurred while processing checkout.',
+                    'code': 'internal_server_error',
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         order = self._base_order_queryset().get(pk=result.order_id)
         payload = OrderSerializer(order).data

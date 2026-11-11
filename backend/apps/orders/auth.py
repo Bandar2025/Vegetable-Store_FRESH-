@@ -42,36 +42,147 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import secrets
+import sqlite3
 from typing import Callable, Iterable, Sequence
 
-from django.conf import settings
-from django.contrib.auth import get_user_model, logout as django_logout
-from django.contrib.auth.hashers import identify_hasher
-from django.core.cache import cache
-from django.db import transaction
-from django.db.models.signals import post_delete
-from django.dispatch import receiver
-from django.http import HttpRequest, JsonResponse
-from django.utils import timezone
-from rest_framework import exceptions, status
-from rest_framework.authentication import TokenAuthentication, get_authorization_header
-from rest_framework.authtoken.models import Token
-from rest_framework.response import Response
-from rest_framework.throttling import BaseThrottle
-
-from apps.orders.models import (
-    AuthSessionToken,
-    AuthThrottleEvent,
-    BranchRoleAssignment,
-    UserIdentityProfile,
-)
 from apps.orders.services import (
     ActorRole,
     AuthenticationBoundaryError,
     ServiceActor,
 )
-from apps.products.models import Branch, Store
+
+try:
+    from django.conf import settings
+    from django.contrib.auth import get_user_model, logout as django_logout
+    from django.contrib.auth.hashers import identify_hasher
+    from django.core.cache import cache
+    from django.db import transaction
+    from django.db.models.signals import post_delete
+    from django.dispatch import receiver
+    from django.http import HttpRequest, JsonResponse
+    from django.utils import timezone
+    from rest_framework import exceptions, status
+    from rest_framework.authentication import TokenAuthentication, get_authorization_header
+    from rest_framework.authtoken.models import Token
+    from rest_framework.response import Response
+    from rest_framework.throttling import BaseThrottle
+
+    from apps.orders.models import (
+        AuthSessionToken,
+        AuthThrottleEvent,
+        BranchRoleAssignment,
+        UserIdentityProfile,
+    )
+    from apps.products.models import Branch, Store
+
+    DJANGO_AVAILABLE = True
+except ImportError:
+    DJANGO_AVAILABLE = False
+    from middleware.auth_rate_limit import (
+        HttpRequest,
+        JsonResponse,
+        cache,
+        settings,
+        status,
+        timezone,
+    )
+
+    def receiver(*args, **kwargs):  # type: ignore[no-redef]
+        def _decorator(func):
+            return func
+        return _decorator
+
+    post_delete = None
+
+    class TokenAuthentication:  # type: ignore[no-redef]
+        keyword = 'Token'
+
+    def get_authorization_header(request) -> bytes:  # type: ignore[no-redef]
+        headers = getattr(request, 'headers', {}) or {}
+        meta = getattr(request, 'META', {}) or {}
+        val = headers.get('Authorization') or headers.get('authorization') or meta.get('HTTP_AUTHORIZATION') or ''
+        return val.encode('utf-8') if isinstance(val, str) else b''
+
+    class BaseThrottle:  # type: ignore[no-redef]
+        pass
+
+    class Response:  # type: ignore[no-redef]
+        def __init__(self, data=None, status: int = 200, headers: dict | None = None):
+            self.data = data
+            self.status_code = status
+            self.headers = dict(headers or {})
+
+    class _FallbackExceptions:
+        class AuthenticationFailed(AuthenticationBoundaryError):
+            pass
+
+    exceptions = _FallbackExceptions()
+
+    def identify_hasher(encoded: str) -> str:  # type: ignore[no-redef]
+        if not isinstance(encoded, str) or not encoded.startswith('pbkdf2_sha256$'):
+            raise ValueError("Invalid password hash format.")
+        parts = encoded.split('$')
+        if len(parts) != 4 or not parts[1].isdigit() or not parts[2] or not parts[3]:
+            raise ValueError("Malformed pbkdf2_sha256 password hash.")
+        return 'pbkdf2_sha256'
+
+    class _FallbackObjectsManager:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def delete(self, *args, **kwargs):
+            return (0, {})
+
+        def create(self, *args, **kwargs):
+            return None
+
+        def bulk_create(self, objs, *args, **kwargs):
+            return objs
+
+    class UserIdentityProfile:  # type: ignore[no-redef]
+        class Role:
+            CUSTOMER = 'CUSTOMER'
+            BRANCH_MANAGER = 'BRANCH_MANAGER'
+            OWNER = 'OWNER'
+
+        objects = _FallbackObjectsManager()
+
+    class BranchRoleAssignment:  # type: ignore[no-redef]
+        objects = _FallbackObjectsManager()
+
+    class AuthSessionToken:  # type: ignore[no-redef]
+        class RevocationReason:
+            LOGOUT = 'LOGOUT'
+            ROTATED = 'ROTATED'
+            REUSE_DETECTED = 'REUSE_DETECTED'
+            EXPIRED = 'EXPIRED'
+            ACCOUNT_INACTIVE = 'ACCOUNT_INACTIVE'
+            REVOKED = 'REVOKED'
+
+        objects = _FallbackObjectsManager()
+
+    class AuthThrottleEvent:  # type: ignore[no-redef]
+        class Scope:
+            LOGIN_REQUEST = 'LOGIN_REQUEST'
+            LOGIN_FAILURE = 'LOGIN_FAILURE'
+            TOKEN_REFRESH_REQUEST = 'TOKEN_REFRESH_REQUEST'
+
+        objects = _FallbackObjectsManager()
+
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class Token:  # type: ignore[no-redef]
+        objects = _FallbackObjectsManager()
+
+    class Branch:  # type: ignore[no-redef]
+        objects = _FallbackObjectsManager()
+
+    class Store:  # type: ignore[no-redef]
+        objects = _FallbackObjectsManager()
 
 
 GENERIC_INVALID_CREDENTIALS_MESSAGE = 'Invalid authentication credentials.'
@@ -99,6 +210,8 @@ LOGIN_RATE_LIMITED_PATHS = frozenset({
     '/api/v1/auth/login/',
     '/api/v1/auth/token',
     '/api/v1/auth/token/',
+    '/api/v1/auth/register',
+    '/api/v1/auth/register/',
 })
 REFRESH_RATE_LIMITED_PATHS = frozenset({
     '/api/v1/auth/refresh',
@@ -385,7 +498,7 @@ def is_token_blocklisted(
     if eff_family and cache.get(f"{CACHE_PREFIX_BLOCK_FAMILY}{eff_family}") is not None:
         return True
 
-    if eff_hash:
+    if eff_hash and DJANGO_AVAILABLE:
         from django.db.models import Q
 
         record = (
@@ -1060,7 +1173,7 @@ def _extract_normalized_username(request) -> str:
     # 1. Check DRF parsed request.data if already available
     data = getattr(request, 'data', None)
     if isinstance(data, dict):
-        raw_username = data.get('username')
+        raw_username = data.get('username') or data.get('email')
         if isinstance(raw_username, str) and raw_username.strip():
             return raw_username.strip().lower()[:150]
 
@@ -1069,7 +1182,7 @@ def _extract_normalized_username(request) -> str:
     post_data = getattr(underlying, 'POST', None)
     if isinstance(post_data, dict) or hasattr(post_data, 'get'):
         try:
-            raw_username = post_data.get('username')
+            raw_username = post_data.get('username') or post_data.get('email')
             if isinstance(raw_username, str) and raw_username.strip():
                 return raw_username.strip().lower()[:150]
         except Exception:
@@ -1082,7 +1195,7 @@ def _extract_normalized_username(request) -> str:
             if decoded_body.startswith('{'):
                 parsed = json.loads(decoded_body)
                 if isinstance(parsed, dict):
-                    raw_username = parsed.get('username')
+                    raw_username = parsed.get('username') or parsed.get('email')
                     if isinstance(raw_username, str) and raw_username.strip():
                         return raw_username.strip().lower()[:150]
     except Exception:
@@ -1528,6 +1641,8 @@ def create_user_with_identity_profile(
     is_active: bool = True,
     profile_is_active: bool = True,
     email: str = '',
+    full_name: str = '',
+    phone_number: str = '',
 ) -> tuple[object, UserIdentityProfile]:
     """
     Safely provisions a Django User with a cryptographically hashed password and
@@ -1543,9 +1658,11 @@ def create_user_with_identity_profile(
     with transaction.atomic():
         user = UserModel.objects.create_user(
             username=username.strip(),
-            email=email.strip() if email else '',
+            email=email.strip().lower() if email else '',
             password=password,
             is_active=is_active,
+            first_name=full_name.strip()[:150] if full_name else '',
+            last_name=phone_number.strip()[:150] if phone_number else '',
         )
         assert_password_hashed(user)
 
@@ -1622,6 +1739,7 @@ def resolve_service_actor_from_user(user) -> ServiceActor:
             role=ActorRole.CUSTOMER.value,
             customer_id=profile.customer_id.strip(),
             authorized_branch_ids=None,
+            store_id=profile.store_id,
         )
 
     if profile.role == UserIdentityProfile.Role.BRANCH_MANAGER:
@@ -1652,6 +1770,7 @@ def resolve_service_actor_from_user(user) -> ServiceActor:
             role=ActorRole.BRANCH_MANAGER.value,
             customer_id=None,
             authorized_branch_ids=active_branch_ids,
+            store_id=profile.store_id,
         )
 
     if profile.role == UserIdentityProfile.Role.OWNER:
@@ -1680,6 +1799,7 @@ def resolve_service_actor_from_user(user) -> ServiceActor:
             role=ActorRole.OWNER.value,
             customer_id=None,
             authorized_branch_ids=active_branch_ids,
+            store_id=profile.store_id,
         )
 
     raise AuthenticationBoundaryError(f"Unsupported identity profile role: {profile.role}")
@@ -1687,8 +1807,9 @@ def resolve_service_actor_from_user(user) -> ServiceActor:
 
 def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
     """
-    Validates that a request does not attempt to spoof `role`, `actor_id`, `customer_id`,
-    `store_id`, or unauthorized `branch_id` via request body, query params, or headers.
+    Validates that a request does not attempt to spoof `role`, `actor_id`, `user_id`,
+    `customer_id`, `store_id`, unauthorized `branch_id`, or internal privilege/state fields
+    via request body, query params, or headers.
     """
     data = getattr(request, 'data', {})
     if not isinstance(data, dict):
@@ -1719,6 +1840,38 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
             "Client-supplied actor_id is not trusted and conflicts with server-resolved identity."
         )
 
+    # 2b. Check user_id spoofing
+    supplied_user_id = (
+        data.get('user_id')
+        if 'user_id' in data
+        else (query_params.get('user_id') or headers.get('X-User-Id'))
+    )
+    if supplied_user_id is not None:
+        user_obj = getattr(request, 'user', None)
+        expected_uid = getattr(user_obj, 'pk', None)
+        if expected_uid is None and actor.actor_id.startswith('user:'):
+            try:
+                expected_uid = int(actor.actor_id.split(':', 1)[1])
+            except (TypeError, ValueError):
+                expected_uid = None
+        if expected_uid is None or str(supplied_user_id).strip() != str(expected_uid):
+            raise AuthenticationBoundaryError(
+                "Client-supplied user_id is not trusted and conflicts with server-resolved identity."
+            )
+
+    # 2c. Reject internal privilege or order-state escalation fields in payload
+    for forbidden_priv_field in (
+        'is_staff',
+        'is_superuser',
+        'authorized_branch_ids',
+        'cancellation_restored',
+        'replayed',
+    ):
+        if forbidden_priv_field in data and data.get(forbidden_priv_field) is not None:
+            raise AuthenticationBoundaryError(
+                f"Client is not permitted to supply internal privilege/state field '{forbidden_priv_field}'."
+            )
+
     # 3. Check customer_id spoofing for CUSTOMER actors
     if actor.role == ActorRole.CUSTOMER.value:
         for raw_cid in (
@@ -1738,12 +1891,1170 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
         or headers.get('X-Store-Id')
     )
     if supplied_store_id is not None:
-        profile = getattr(request.user, 'identity_profile', None)
+        profile = getattr(getattr(request, 'user', None), 'identity_profile', None)
+        effective_store_id = getattr(profile, 'store_id', None) if profile is not None else actor.store_id
         try:
             parsed_store_id = int(supplied_store_id)
         except (TypeError, ValueError) as exc:
             raise AuthenticationBoundaryError("Invalid client-supplied store_id.") from exc
-        if profile is None or profile.store_id is None or profile.store_id != parsed_store_id:
+        if effective_store_id is None or effective_store_id != parsed_store_id:
             raise AuthenticationBoundaryError(
                 "Actor is not authorized for the client-supplied store_id."
             )
+
+
+# ==============================================================================
+# Customer Registration & Standalone SQLite Auth / JWT Lifecycle Engine
+# ==============================================================================
+
+EMAIL_VALIDATION_REGEX = re.compile(r'^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+SAUDI_PHONE_VALIDATION_REGEX = re.compile(r'^(05\d{8}|\+?9665\d{8})$')
+USERNAME_VALIDATION_REGEX = re.compile(r'^[A-Za-z0-9@_.+-]+$')
+
+FORBIDDEN_REGISTRATION_FIELDS = frozenset({
+    'role',
+    'actor_role',
+    'is_staff',
+    'is_superuser',
+    'branch_id',
+    'branch',
+    'store_id',
+    'store',
+    'authorized_branch_ids',
+    'customer_id',
+    'actor_id',
+})
+
+RESERVED_DEMO_EMAILS = frozenset({
+    'owner.demo@fresh.sa',
+    'admin.demo@fresh.sa',
+    'customer.demo@fresh.sa',
+})
+
+COMMON_WEAK_PASSWORDS = frozenset({
+    'password',
+    'password123',
+    '12345678',
+    '123456789',
+    'qwerty123',
+    'admin123',
+    'welcome123',
+    'fresh123',
+})
+
+
+class CustomerRegistrationValidationError(Exception):
+    """
+    Raised when customer registration input fails validation, uniqueness checks,
+    or privilege-escalation guards (`role`, `is_staff`, `is_superuser`, `branch_id`, `store_id`).
+    """
+    def __init__(self, errors: dict[str, list[str]], status_code: int = 400):
+        self.errors = errors
+        self.status_code = status_code
+        super().__init__(json.dumps(errors, ensure_ascii=False))
+
+
+def normalize_saudi_phone(raw_phone: str) -> str:
+    cleaned = raw_phone.strip().replace(' ', '').replace('-', '')
+    if not cleaned:
+        return ''
+    if not SAUDI_PHONE_VALIDATION_REGEX.match(cleaned):
+        raise ValueError("Invalid Saudi mobile number format.")
+    if cleaned.startswith('+9665'):
+        return '05' + cleaned[5:]
+    if cleaned.startswith('9665'):
+        return '05' + cleaned[4:]
+    return cleaned
+
+
+def hash_password_pbkdf2_sha256(
+    password: str,
+    *,
+    salt: str | None = None,
+    iterations: int = 600000,
+) -> str:
+    """
+    Produces a Django-compatible `pbkdf2_sha256$<iterations>$<salt>$<base64_hash>` password digest.
+    Never stores or returns plaintext passwords.
+    """
+    if not isinstance(password, str) or not password:
+        raise ValueError("password must be a non-empty string.")
+    effective_salt = salt if (isinstance(salt, str) and salt) else secrets.token_hex(12)
+    dk = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        effective_salt.encode('utf-8'),
+        iterations,
+    )
+    b64_hash = base64.b64encode(dk).decode('ascii').strip()
+    return f"pbkdf2_sha256${iterations}${effective_salt}${b64_hash}"
+
+
+def verify_password_pbkdf2_sha256(password: str, encoded: str) -> bool:
+    """
+    Constant-time verification of a password against a `pbkdf2_sha256$...` digest.
+    """
+    if not isinstance(password, str) or not password or not isinstance(encoded, str):
+        return False
+    if not encoded.startswith('pbkdf2_sha256$'):
+        return False
+    parts = encoded.split('$')
+    if len(parts) != 4:
+        return False
+    try:
+        iterations = int(parts[1])
+        salt = parts[2]
+    except (TypeError, ValueError):
+        return False
+    if iterations < 1 or not salt:
+        return False
+    expected = hash_password_pbkdf2_sha256(password, salt=salt, iterations=iterations)
+    return hmac.compare_digest(expected.encode('utf-8'), encoded.encode('utf-8'))
+
+
+def validate_and_normalize_customer_registration_payload(
+    raw_payload: dict,
+    *,
+    request=None,
+) -> dict:
+    """
+    Validates customer self-registration input and enforces zero-trust role/privilege boundaries:
+    - Rejects any client attempt to supply `role`, `actor_role`, `is_staff`, `is_superuser`,
+      `branch_id`, `branch`, `store_id`, `store`, `authorized_branch_ids`, `customer_id`, or `actor_id`.
+    - Validates `email`, `username` (optional; defaults to normalized `email`), `full_name`,
+      optional/Saudi `phone_number`, and `password` strength (`>= 8` chars, letters + digits,
+      not common/weak, matches `confirm_password` when supplied).
+    """
+    if not isinstance(raw_payload, dict):
+        raise CustomerRegistrationValidationError(
+            {'detail': ['Invalid registration request payload.']},
+            status_code=400,
+        )
+
+    errors: dict[str, list[str]] = {}
+
+    # 1. Strict privilege escalation guard on payload, query_params, and headers
+    for key in raw_payload.keys():
+        norm_key = str(key).strip().lower()
+        if norm_key in FORBIDDEN_REGISTRATION_FIELDS:
+            errors.setdefault(str(key), []).append(
+                f"Field '{key}' is prohibited during public customer registration. "
+                "Self-registration strictly creates CUSTOMER accounts only."
+            )
+
+    if request is not None:
+        query_params = getattr(request, 'query_params', {}) or {}
+        headers = getattr(request, 'headers', {}) or {}
+        meta = getattr(request, 'META', {}) or {}
+        for qk in query_params.keys():
+            if str(qk).strip().lower() in FORBIDDEN_REGISTRATION_FIELDS:
+                errors.setdefault(str(qk), []).append(
+                    f"Query parameter '{qk}' is prohibited during public customer registration."
+                )
+        for hdr_name in ('X-Actor-Role', 'X-Actor-Id', 'X-Customer-Id', 'X-Store-Id', 'X-Branch-Id'):
+            meta_key = 'HTTP_' + hdr_name.upper().replace('-', '_')
+            if headers.get(hdr_name) is not None or meta.get(meta_key) is not None:
+                errors.setdefault('role', []).append(
+                    f"Header '{hdr_name}' is prohibited during public customer registration."
+                )
+
+    if errors:
+        raise CustomerRegistrationValidationError(errors, status_code=400)
+
+    # 2. Email validation
+    raw_email = raw_payload.get('email')
+    clean_email = raw_email.strip().lower() if isinstance(raw_email, str) else ''
+    if not clean_email:
+        errors.setdefault('email', []).append('Email address is required.')
+    elif len(clean_email) > 254 or not EMAIL_VALIDATION_REGEX.match(clean_email):
+        errors.setdefault('email', []).append('Enter a valid email address.')
+    elif clean_email in RESERVED_DEMO_EMAILS:
+        errors.setdefault('email', []).append('This email address is reserved and cannot be registered.')
+
+    # 3. Username validation (defaults to normalized email if not explicitly provided)
+    raw_username = raw_payload.get('username')
+    clean_username = raw_username.strip() if isinstance(raw_username, str) else ''
+    if clean_username:
+        if len(clean_username) < 3 or len(clean_username) > 150:
+            errors.setdefault('username', []).append('Username must be between 3 and 150 characters.')
+        elif not USERNAME_VALIDATION_REGEX.match(clean_username):
+            errors.setdefault('username', []).append(
+                'Username may contain only letters, digits, and @/./+/-/_ characters.'
+            )
+        elif clean_username.lower() in RESERVED_DEMO_EMAILS:
+            errors.setdefault('username', []).append('This username is reserved.')
+    else:
+        clean_username = clean_email
+
+    # 4. Full name validation
+    raw_full_name = raw_payload.get('full_name')
+    if raw_full_name is None:
+        raw_full_name = raw_payload.get('name')
+    clean_full_name = raw_full_name.strip() if isinstance(raw_full_name, str) else ''
+    if not clean_full_name:
+        if isinstance(raw_username, str) and raw_username.strip() and '@' not in raw_username:
+            clean_full_name = raw_username.strip()
+        else:
+            errors.setdefault('full_name', []).append('Full name is required.')
+    elif len(clean_full_name) < 3:
+        errors.setdefault('full_name', []).append('Full name must be at least 3 characters long.')
+    elif len(clean_full_name) > 150:
+        errors.setdefault('full_name', []).append('Full name cannot exceed 150 characters.')
+
+    # 5. Phone number validation (normalized Saudi format when supplied)
+    raw_phone = raw_payload.get('phone_number')
+    if raw_phone is None:
+        raw_phone = raw_payload.get('phone')
+    clean_phone = ''
+    if raw_phone is not None and str(raw_phone).strip():
+        try:
+            clean_phone = normalize_saudi_phone(str(raw_phone))
+        except ValueError:
+            errors.setdefault('phone_number', []).append(
+                'Enter a valid Saudi mobile number starting with 05 (10 digits) or +9665.'
+            )
+
+    # 6. Password & confirm_password validation
+    raw_password = raw_payload.get('password')
+    if not isinstance(raw_password, str) or not raw_password:
+        errors.setdefault('password', []).append('Password is required.')
+    else:
+        if len(raw_password) < 8:
+            errors.setdefault('password', []).append(
+                'Password must be at least 8 characters long.'
+            )
+        has_letter = any(ch.isalpha() for ch in raw_password)
+        has_digit = any(ch.isdigit() for ch in raw_password)
+        if not has_letter or not has_digit:
+            errors.setdefault('password', []).append(
+                'Password must contain both letters and numbers.'
+            )
+        lower_pw = raw_password.strip().lower()
+        email_local = clean_email.split('@')[0].lower() if '@' in clean_email else ''
+        if (
+            lower_pw in COMMON_WEAK_PASSWORDS
+            or (clean_username and lower_pw == clean_username.lower())
+            or (clean_email and lower_pw == clean_email.lower())
+            or (email_local and len(email_local) >= 3 and lower_pw == email_local)
+        ):
+            errors.setdefault('password', []).append(
+                'Password is too common or too similar to the username/email.'
+            )
+        if DJANGO_AVAILABLE and 'password' not in errors:
+            try:
+                from django.contrib.auth.password_validation import validate_password
+                from django.core.exceptions import ValidationError as DjangoValidationError
+
+                validate_password(raw_password)
+            except DjangoValidationError as exc:
+                errors.setdefault('password', []).extend(list(exc.messages))
+
+    raw_confirm = raw_payload.get('confirm_password')
+    if raw_confirm is not None:
+        if not isinstance(raw_confirm, str) or raw_confirm != raw_password:
+            errors.setdefault('confirm_password', []).append('Passwords do not match.')
+
+    if errors:
+        raise CustomerRegistrationValidationError(errors, status_code=400)
+
+    return {
+        'username': clean_username,
+        'email': clean_email,
+        'full_name': clean_full_name,
+        'phone_number': clean_phone,
+        'password': raw_password,
+    }
+
+
+def ensure_sqlite_auth_schema(conn: sqlite3.Connection) -> None:
+    """
+    Ensures `auth_user`, `orders_useridentityprofile`, `orders_branchroleassignment`,
+    `orders_authsessiontoken`, and `orders_auththrottleevent` exist on `conn` with
+    database-level CHECK and UNIQUE constraints matching the Django migrations.
+    """
+    conn.execute('PRAGMA foreign_keys = ON;')
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS auth_user (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            password VARCHAR(128) NOT NULL CHECK (password <> ''),
+            last_login TEXT NULL,
+            is_superuser BOOLEAN NOT NULL DEFAULT 0,
+            username VARCHAR(150) NOT NULL UNIQUE CHECK (username <> ''),
+            first_name VARCHAR(150) NOT NULL DEFAULT '',
+            last_name VARCHAR(150) NOT NULL DEFAULT '',
+            email VARCHAR(254) NOT NULL DEFAULT '',
+            is_staff BOOLEAN NOT NULL DEFAULT 0,
+            is_active BOOLEAN NOT NULL DEFAULT 1,
+            date_joined TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS orders_useridentityprofile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE REFERENCES auth_user(id) ON DELETE CASCADE,
+            role VARCHAR(30) NOT NULL,
+            customer_id VARCHAR(100) NULL UNIQUE,
+            store_id INTEGER NULL REFERENCES products_store(id) ON DELETE RESTRICT,
+            is_active BOOLEAN NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT identity_profile_role_valid CHECK (
+                role IN ('CUSTOMER', 'BRANCH_MANAGER', 'OWNER')
+            ),
+            CONSTRAINT identity_profile_cust_id_non_empty CHECK (
+                customer_id IS NULL OR customer_id <> ''
+            ),
+            CONSTRAINT identity_profile_customer_requires_cust_id CHECK (
+                role <> 'CUSTOMER' OR (customer_id IS NOT NULL AND customer_id <> '')
+            ),
+            CONSTRAINT identity_profile_staff_requires_store CHECK (
+                role NOT IN ('BRANCH_MANAGER', 'OWNER') OR store_id IS NOT NULL
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS orders_branchroleassignment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id INTEGER NOT NULL REFERENCES orders_useridentityprofile(id) ON DELETE RESTRICT,
+            branch_id INTEGER NOT NULL REFERENCES products_branch(id) ON DELETE RESTRICT,
+            is_active BOOLEAN NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT uniq_profile_branch_assignment UNIQUE (profile_id, branch_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS orders_authsessiontoken (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES auth_user(id) ON DELETE CASCADE,
+            token_family_id VARCHAR(64) NOT NULL,
+            access_token_hash VARCHAR(64) NOT NULL UNIQUE,
+            refresh_token_hash VARCHAR(64) NOT NULL UNIQUE,
+            access_expires_at TEXT NOT NULL,
+            refresh_expires_at TEXT NOT NULL,
+            revoked_at TEXT NULL,
+            revocation_reason VARCHAR(64) NOT NULL DEFAULT '',
+            replaced_by_id INTEGER NULL UNIQUE REFERENCES orders_authsessiontoken(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_used_at TEXT NULL,
+            CONSTRAINT auth_token_family_non_empty CHECK (token_family_id <> ''),
+            CONSTRAINT auth_access_hash_non_empty CHECK (access_token_hash <> ''),
+            CONSTRAINT auth_refresh_hash_non_empty CHECK (refresh_token_hash <> ''),
+            CONSTRAINT auth_access_ne_refresh_hash CHECK (access_token_hash <> refresh_token_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS orders_auththrottleevent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope VARCHAR(40) NOT NULL CHECK (
+                scope IN ('LOGIN_REQUEST', 'LOGIN_FAILURE', 'TOKEN_REFRESH_REQUEST')
+            ),
+            identifier VARCHAR(255) NOT NULL CHECK (identifier <> ''),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+def _issue_session_token_pair_sqlite(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    token_family_id: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    effective_now = now or timezone.now()
+    access_ttl = get_access_token_ttl_seconds()
+    refresh_ttl = get_refresh_token_ttl_seconds()
+
+    access_expires_at = effective_now + timedelta(seconds=access_ttl)
+    refresh_expires_at = effective_now + timedelta(seconds=refresh_ttl)
+    family_id = (
+        token_family_id.strip()
+        if isinstance(token_family_id, str) and token_family_id.strip()
+        else secrets.token_hex(16)
+    )
+
+    pair_jti = secrets.token_hex(16)
+    access_jti = secrets.token_hex(16)
+    refresh_jti = secrets.token_hex(16)
+    while refresh_jti == access_jti:
+        refresh_jti = secrets.token_hex(16)
+
+    iat_ts = int(effective_now.timestamp())
+    access_exp_ts = int(access_expires_at.timestamp())
+    refresh_exp_ts = int(refresh_expires_at.timestamp())
+    issuer = getattr(settings, 'AUTH_JWT_ISSUER', 'fresh-backend')
+
+    raw_access_token = encode_jwt(
+        {
+            'iss': issuer,
+            'sub': str(user_id),
+            'user_id': int(user_id),
+            'jti': access_jti,
+            'pair_jti': pair_jti,
+            'family_id': family_id,
+            'type': 'access',
+            'iat': iat_ts,
+            'exp': access_exp_ts,
+        }
+    )
+    raw_refresh_token = encode_jwt(
+        {
+            'iss': issuer,
+            'sub': str(user_id),
+            'user_id': int(user_id),
+            'jti': refresh_jti,
+            'pair_jti': pair_jti,
+            'family_id': family_id,
+            'type': 'refresh',
+            'iat': iat_ts,
+            'exp': refresh_exp_ts,
+        }
+    )
+
+    access_hash = hash_opaque_token(raw_access_token)
+    refresh_hash = hash_opaque_token(raw_refresh_token)
+
+    cur = conn.execute(
+        """
+        INSERT INTO orders_authsessiontoken (
+            user_id, token_family_id, access_token_hash, refresh_token_hash,
+            access_expires_at, refresh_expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            family_id,
+            access_hash,
+            refresh_hash,
+            access_expires_at.isoformat(),
+            refresh_expires_at.isoformat(),
+        ),
+    )
+    session_token_id = int(cur.lastrowid)
+
+    from types import SimpleNamespace
+    token_record = SimpleNamespace(
+        pk=session_token_id,
+        user_id=user_id,
+        token_family_id=family_id,
+        access_token_hash=access_hash,
+        refresh_token_hash=refresh_hash,
+    )
+
+    allowlist_token_pair(
+        token_record,  # type: ignore[arg-type]
+        raw_access_token=raw_access_token,
+        raw_refresh_token=raw_refresh_token,
+        access_jti=access_jti,
+        refresh_jti=refresh_jti,
+        access_ttl=access_ttl,
+        refresh_ttl=refresh_ttl,
+    )
+
+    return {
+        'session_token_id': session_token_id,
+        'token_family_id': family_id,
+        'access_token': raw_access_token,
+        'refresh_token': raw_refresh_token,
+        'access_expires_at': access_expires_at,
+        'refresh_expires_at': refresh_expires_at,
+        'access_expires_in': access_ttl,
+        'refresh_expires_in': refresh_ttl,
+    }
+
+
+def register_customer_account(
+    raw_payload: dict,
+    *,
+    request=None,
+    conn: sqlite3.Connection | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """
+    Validates and registers a new `CUSTOMER` account, hashes the password with PBKDF2-SHA256,
+    creates its `UserIdentityProfile(role='CUSTOMER')` with no store or branch privileges,
+    issues an initial JWT access + refresh token pair, and returns the unified auth payload.
+    Supports both Django ORM (`conn is None and DJANGO_AVAILABLE`) and SQLite (`conn is not None`).
+    """
+    if request is not None:
+        allowed, wait_sec = check_and_record_login_rate_limit(request)
+        if not allowed:
+            raise AuthenticationBoundaryError(
+                f"Request was throttled. Expected available in {wait_sec} seconds."
+            )
+
+    validated = validate_and_normalize_customer_registration_payload(raw_payload, request=request)
+    username = validated['username']
+    email = validated['email']
+    full_name = validated['full_name']
+    phone_number = validated['phone_number']
+    password = validated['password']
+
+    if conn is not None or not DJANGO_AVAILABLE:
+        if conn is None:
+            raise RuntimeError("A sqlite3.Connection is required when Django ORM is unavailable.")
+        ensure_sqlite_auth_schema(conn)
+        dup_errors: dict[str, list[str]] = {}
+        row_user = conn.execute(
+            'SELECT id FROM auth_user WHERE LOWER(username) = LOWER(?)',
+            (username,),
+        ).fetchone()
+        if row_user is not None:
+            dup_errors.setdefault('username', []).append('A user with this username already exists.')
+
+        row_email = conn.execute(
+            'SELECT id FROM auth_user WHERE LOWER(email) = LOWER(?)',
+            (email,),
+        ).fetchone()
+        if row_email is not None:
+            dup_errors.setdefault('email', []).append('An account with this email address already exists.')
+
+        if phone_number:
+            row_phone = conn.execute(
+                'SELECT id FROM auth_user WHERE last_name = ?',
+                (phone_number,),
+            ).fetchone()
+            if row_phone is not None:
+                dup_errors.setdefault('phone_number', []).append(
+                    'An account with this phone number already exists.'
+                )
+
+        if dup_errors:
+            raise CustomerRegistrationValidationError(dup_errors, status_code=400)
+
+        password_hash = hash_password_pbkdf2_sha256(password)
+        identify_hasher(password_hash)
+
+        cur = conn.execute(
+            """
+            INSERT INTO auth_user (
+                password, is_superuser, username, first_name, last_name, email, is_staff, is_active
+            ) VALUES (?, 0, ?, ?, ?, ?, 0, 1)
+            """,
+            (password_hash, username, full_name, phone_number, email),
+        )
+        user_id = int(cur.lastrowid)
+        customer_id = f"cust-user-{user_id}"
+
+        conn.execute(
+            """
+            INSERT INTO orders_useridentityprofile (
+                user_id, role, customer_id, store_id, is_active
+            ) VALUES (?, 'CUSTOMER', ?, NULL, 1)
+            """,
+            (user_id, customer_id),
+        )
+
+        token_info = _issue_session_token_pair_sqlite(conn, user_id, now=now)
+        conn.commit()
+
+        return {
+            'token': token_info['access_token'],
+            'access_token': token_info['access_token'],
+            'refresh_token': token_info['refresh_token'],
+            'token_type': 'Token',
+            'expires_in': token_info['access_expires_in'],
+            'expires_at': token_info['access_expires_at'].isoformat(),
+            'refresh_expires_in': token_info['refresh_expires_in'],
+            'refresh_expires_at': token_info['refresh_expires_at'].isoformat(),
+            'actor_id': f"user:{user_id}",
+            'username': username,
+            'email': email,
+            'full_name': full_name,
+            'phone_number': phone_number,
+            'role': ActorRole.CUSTOMER.value,
+            'customer_id': customer_id,
+            'store_id': None,
+            'authorized_branch_ids': None,
+        }
+
+    # Django ORM path
+    UserModel = get_user_model()
+    with transaction.atomic():
+        dup_errors = {}
+        if UserModel.objects.filter(username__iexact=username).exists():
+            dup_errors.setdefault('username', []).append('A user with this username already exists.')
+        if UserModel.objects.filter(email__iexact=email).exists():
+            dup_errors.setdefault('email', []).append('An account with this email address already exists.')
+        if phone_number and UserModel.objects.filter(last_name=phone_number).exists():
+            dup_errors.setdefault('phone_number', []).append(
+                'An account with this phone number already exists.'
+            )
+        if dup_errors:
+            raise CustomerRegistrationValidationError(dup_errors, status_code=400)
+
+        user, profile = create_user_with_identity_profile(
+            username=username,
+            email=email,
+            password=password,
+            role=UserIdentityProfile.Role.CUSTOMER,
+            full_name=full_name,
+            phone_number=phone_number,
+            is_active=True,
+            profile_is_active=True,
+        )
+        actor = resolve_service_actor_from_user(user)
+        token_pair = issue_session_token_pair(user, now=now)
+
+    return {
+        'token': token_pair.access_token,
+        'access_token': token_pair.access_token,
+        'refresh_token': token_pair.refresh_token,
+        'token_type': 'Token',
+        'expires_in': token_pair.access_expires_in,
+        'expires_at': token_pair.access_expires_at.isoformat(),
+        'refresh_expires_in': token_pair.refresh_expires_in,
+        'refresh_expires_at': token_pair.refresh_expires_at.isoformat(),
+        'actor_id': actor.actor_id,
+        'username': user.username,
+        'email': user.email or email,
+        'full_name': user.first_name or full_name,
+        'phone_number': user.last_name or phone_number,
+        'role': actor.role,
+        'customer_id': actor.customer_id,
+        'store_id': profile.store_id,
+        'authorized_branch_ids': (
+            sorted(actor.authorized_branch_ids)
+            if actor.authorized_branch_ids is not None
+            else None
+        ),
+    }
+
+
+def _resolve_actor_sqlite(conn: sqlite3.Connection, user_id: int) -> tuple[dict, ServiceActor]:
+    row = conn.execute(
+        """
+        SELECT
+            u.id, u.username, u.email, u.first_name, u.last_name, u.password, u.is_active AS user_active,
+            p.id AS profile_id, p.role, p.customer_id, p.store_id, p.is_active AS profile_active
+        FROM auth_user u
+        LEFT JOIN orders_useridentityprofile p ON p.user_id = u.id
+        WHERE u.id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        raise AuthenticationBoundaryError(GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    (
+        uid,
+        uname,
+        uemail,
+        first_name,
+        last_name,
+        pw_hash,
+        user_active,
+        profile_id,
+        role,
+        customer_id,
+        store_id,
+        profile_active,
+    ) = row
+
+    if not user_active:
+        raise AuthenticationBoundaryError("User account is inactive.")
+    try:
+        identify_hasher(pw_hash)
+    except ValueError as exc:
+        raise AuthenticationBoundaryError("User password is not cryptographically hashed.") from exc
+
+    if profile_id is None or not profile_active:
+        raise AuthenticationBoundaryError("User identity profile is missing or inactive.")
+
+    actor_id = f"user:{uid}"
+    if role == 'CUSTOMER':
+        if not customer_id or not str(customer_id).strip():
+            raise AuthenticationBoundaryError("Customer profile missing customer_id.")
+        actor = ServiceActor(
+            actor_id=actor_id,
+            role=ActorRole.CUSTOMER.value,
+            customer_id=str(customer_id).strip(),
+            authorized_branch_ids=None,
+        )
+    elif role == 'BRANCH_MANAGER':
+        if store_id is None:
+            raise AuthenticationBoundaryError("Branch manager missing store_id.")
+        store_row = conn.execute(
+            'SELECT is_active FROM products_store WHERE id = ?',
+            (store_id,),
+        ).fetchone()
+        if store_row is None or not store_row[0]:
+            raise AuthenticationBoundaryError("Store is inactive.")
+        branch_rows = conn.execute(
+            """
+            SELECT bra.branch_id
+            FROM orders_branchroleassignment bra
+            JOIN products_branch b ON b.id = bra.branch_id
+            WHERE bra.profile_id = ? AND bra.is_active = 1 AND b.is_active = 1 AND b.store_id = ?
+            """,
+            (profile_id, store_id),
+        ).fetchall()
+        branch_ids = frozenset(int(r[0]) for r in branch_rows)
+        if not branch_ids:
+            raise AuthenticationBoundaryError("Branch manager has no active branches.")
+        actor = ServiceActor(
+            actor_id=actor_id,
+            role=ActorRole.BRANCH_MANAGER.value,
+            customer_id=None,
+            authorized_branch_ids=branch_ids,
+        )
+    elif role == 'OWNER':
+        if store_id is None:
+            raise AuthenticationBoundaryError("Owner missing store_id.")
+        store_row = conn.execute(
+            'SELECT is_active FROM products_store WHERE id = ?',
+            (store_id,),
+        ).fetchone()
+        if store_row is None or not store_row[0]:
+            raise AuthenticationBoundaryError("Store is inactive.")
+        branch_rows = conn.execute(
+            'SELECT id FROM products_branch WHERE store_id = ? AND is_active = 1',
+            (store_id,),
+        ).fetchall()
+        branch_ids = frozenset(int(r[0]) for r in branch_rows)
+        if not branch_ids:
+            raise AuthenticationBoundaryError("Owner store has no active branches.")
+        actor = ServiceActor(
+            actor_id=actor_id,
+            role=ActorRole.OWNER.value,
+            customer_id=None,
+            authorized_branch_ids=branch_ids,
+        )
+    else:
+        raise AuthenticationBoundaryError(f"Unsupported role: {role}")
+
+    user_meta = {
+        'id': int(uid),
+        'username': uname,
+        'email': uemail or '',
+        'full_name': first_name or uname,
+        'phone_number': last_name or '',
+        'store_id': int(store_id) if store_id is not None else None,
+    }
+    return user_meta, actor
+
+
+def login_with_credentials_sqlite(
+    conn: sqlite3.Connection,
+    username_or_email: str,
+    password: str,
+    *,
+    request=None,
+    now: datetime | None = None,
+) -> dict:
+    """
+    Authenticates a user by username or email against `auth_user` in SQLite, enforces
+    rate limiting and failed-attempt tracking, verifies active `UserIdentityProfile`,
+    and issues an HS256 JWT access + refresh token pair.
+    """
+    ensure_sqlite_auth_schema(conn)
+    if request is not None:
+        allowed, wait_sec = check_and_record_login_rate_limit(request)
+        if not allowed:
+            raise AuthenticationBoundaryError(
+                f"Request was throttled. Expected available in {wait_sec} seconds."
+            )
+
+    ident = (username_or_email or '').strip()
+    if not ident or not isinstance(password, str) or not password:
+        if request is not None:
+            record_failed_login_attempt(request, ident)
+        raise AuthenticationBoundaryError(GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    row = conn.execute(
+        """
+        SELECT id, username, password, is_active
+        FROM auth_user
+        WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)
+        ORDER BY CASE WHEN LOWER(username) = LOWER(?) THEN 0 ELSE 1 END, id ASC
+        LIMIT 1
+        """,
+        (ident, ident, ident),
+    ).fetchone()
+
+    if row is None:
+        if request is not None:
+            record_failed_login_attempt(request, ident)
+        raise AuthenticationBoundaryError(GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    user_id, uname, pw_hash, is_active = int(row[0]), str(row[1]), str(row[2]), bool(row[3])
+    if not is_active:
+        conn.execute(
+            """
+            UPDATE orders_authsessiontoken
+            SET revoked_at = ?, revocation_reason = 'ACCOUNT_INACTIVE'
+            WHERE user_id = ? AND revoked_at IS NULL
+            """,
+            ((now or timezone.now()).isoformat(), user_id),
+        )
+        conn.commit()
+        if request is not None:
+            record_failed_login_attempt(request, uname)
+        raise AuthenticationBoundaryError(GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    if not verify_password_pbkdf2_sha256(password, pw_hash):
+        if request is not None:
+            record_failed_login_attempt(request, uname)
+        raise AuthenticationBoundaryError(GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    try:
+        user_meta, actor = _resolve_actor_sqlite(conn, user_id)
+    except AuthenticationBoundaryError:
+        conn.execute(
+            """
+            UPDATE orders_authsessiontoken
+            SET revoked_at = ?, revocation_reason = 'ACCOUNT_INACTIVE'
+            WHERE user_id = ? AND revoked_at IS NULL
+            """,
+            ((now or timezone.now()).isoformat(), user_id),
+        )
+        conn.commit()
+        if request is not None:
+            record_failed_login_attempt(request, uname)
+        raise AuthenticationBoundaryError(GENERIC_INVALID_CREDENTIALS_MESSAGE)
+
+    if request is not None:
+        clear_failed_login_attempts(request, uname)
+
+    token_info = _issue_session_token_pair_sqlite(conn, user_id, now=now)
+    conn.commit()
+
+    return {
+        'token': token_info['access_token'],
+        'access_token': token_info['access_token'],
+        'refresh_token': token_info['refresh_token'],
+        'token_type': 'Token',
+        'expires_in': token_info['access_expires_in'],
+        'expires_at': token_info['access_expires_at'].isoformat(),
+        'refresh_expires_in': token_info['refresh_expires_in'],
+        'refresh_expires_at': token_info['refresh_expires_at'].isoformat(),
+        'actor_id': actor.actor_id,
+        'username': user_meta['username'],
+        'email': user_meta['email'],
+        'full_name': user_meta['full_name'],
+        'phone_number': user_meta['phone_number'],
+        'role': actor.role,
+        'customer_id': actor.customer_id,
+        'store_id': user_meta['store_id'],
+        'authorized_branch_ids': (
+            sorted(actor.authorized_branch_ids)
+            if actor.authorized_branch_ids is not None
+            else None
+        ),
+    }
+
+
+def rotate_session_token_sqlite(
+    conn: sqlite3.Connection,
+    raw_refresh_token: str,
+    *,
+    request=None,
+    now: datetime | None = None,
+) -> dict:
+    """
+    SQLite-backed single-use refresh token rotation with replay/reuse detection (`REUSE_DETECTED`).
+    """
+    ensure_sqlite_auth_schema(conn)
+    if request is not None:
+        allowed, wait_sec = check_and_record_refresh_rate_limit(request)
+        if not allowed:
+            raise AuthenticationBoundaryError(
+                f"Request was throttled. Expected available in {wait_sec} seconds."
+            )
+
+    if not isinstance(raw_refresh_token, str) or not raw_refresh_token.strip():
+        raise AuthenticationBoundaryError(GENERIC_INVALID_REFRESH_TOKEN_MESSAGE)
+
+    effective_now = now or timezone.now()
+    cleaned_refresh = raw_refresh_token.strip()
+
+    jwt_claims = decode_and_verify_jwt(
+        cleaned_refresh,
+        expected_type='refresh',
+        verify_exp=False,
+        now=effective_now,
+    )
+    exp_claim = jwt_claims.get('exp')
+    jwt_expired = not isinstance(exp_claim, (int, float)) or effective_now.timestamp() >= float(exp_claim)
+    refresh_hash = hash_opaque_token(cleaned_refresh)
+    refresh_jti = jwt_claims.get('jti')
+
+    row = conn.execute(
+        """
+        SELECT id, user_id, token_family_id, access_token_hash, refresh_token_hash,
+               access_expires_at, refresh_expires_at, revoked_at, revocation_reason
+        FROM orders_authsessiontoken
+        WHERE refresh_token_hash = ?
+        """,
+        (refresh_hash,),
+    ).fetchone()
+    if row is None:
+        raise AuthenticationBoundaryError(GENERIC_INVALID_REFRESH_TOKEN_MESSAGE)
+
+    (
+        tok_id,
+        user_id,
+        family_id,
+        access_hash,
+        ref_hash,
+        _acc_exp_str,
+        ref_exp_str,
+        revoked_at,
+        revocation_reason,
+    ) = row
+
+    if revoked_at is not None:
+        if revocation_reason == 'ROTATED':
+            fam_rows = conn.execute(
+                'SELECT access_token_hash, refresh_token_hash FROM orders_authsessiontoken WHERE token_family_id = ?',
+                (family_id,),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE orders_authsessiontoken
+                SET revoked_at = ?, revocation_reason = 'REUSE_DETECTED'
+                WHERE token_family_id = ? AND revoked_at IS NULL
+                """,
+                (effective_now.isoformat(), family_id),
+            )
+            conn.commit()
+            blocklist_token_hashes(
+                access_token_hashes=[r[0] for r in fam_rows],
+                refresh_token_hashes=[r[1] for r in fam_rows],
+                jtis=[refresh_jti] if refresh_jti else (),
+                reason='REUSE_DETECTED',
+            )
+            blocklist_token_family(family_id, reason='REUSE_DETECTED')
+        raise AuthenticationBoundaryError(GENERIC_INVALID_REFRESH_TOKEN_MESSAGE)
+
+    ref_exp_dt = datetime.fromisoformat(ref_exp_str)
+    if jwt_expired or effective_now >= ref_exp_dt:
+        conn.execute(
+            """
+            UPDATE orders_authsessiontoken
+            SET revoked_at = ?, revocation_reason = 'EXPIRED'
+            WHERE id = ?
+            """,
+            (effective_now.isoformat(), tok_id),
+        )
+        conn.commit()
+        blocklist_token_hashes(
+            access_token_hashes=[access_hash],
+            refresh_token_hashes=[ref_hash],
+            jtis=[refresh_jti] if refresh_jti else (),
+            reason='EXPIRED',
+        )
+        raise AuthenticationBoundaryError(GENERIC_INVALID_REFRESH_TOKEN_MESSAGE)
+
+    user_meta, actor = _resolve_actor_sqlite(conn, int(user_id))
+
+    blocklist_token_hashes(
+        access_token_hashes=[access_hash],
+        refresh_token_hashes=[ref_hash],
+        jtis=[refresh_jti] if refresh_jti else (),
+        reason='ROTATED',
+    )
+
+    new_token_info = _issue_session_token_pair_sqlite(
+        conn,
+        int(user_id),
+        token_family_id=family_id,
+        now=effective_now,
+    )
+    conn.execute(
+        """
+        UPDATE orders_authsessiontoken
+        SET revoked_at = ?, revocation_reason = 'ROTATED', replaced_by_id = ?, last_used_at = ?
+        WHERE id = ?
+        """,
+        (
+            effective_now.isoformat(),
+            new_token_info['session_token_id'],
+            effective_now.isoformat(),
+            tok_id,
+        ),
+    )
+    conn.commit()
+
+    return {
+        'token': new_token_info['access_token'],
+        'access_token': new_token_info['access_token'],
+        'refresh_token': new_token_info['refresh_token'],
+        'token_type': 'Token',
+        'expires_in': new_token_info['access_expires_in'],
+        'expires_at': new_token_info['access_expires_at'].isoformat(),
+        'refresh_expires_in': new_token_info['refresh_expires_in'],
+        'refresh_expires_at': new_token_info['refresh_expires_at'].isoformat(),
+        'actor_id': actor.actor_id,
+        'username': user_meta['username'],
+        'email': user_meta['email'],
+        'full_name': user_meta['full_name'],
+        'phone_number': user_meta['phone_number'],
+        'role': actor.role,
+        'customer_id': actor.customer_id,
+        'store_id': user_meta['store_id'],
+        'authorized_branch_ids': (
+            sorted(actor.authorized_branch_ids)
+            if actor.authorized_branch_ids is not None
+            else None
+        ),
+    }
+
+
+def authenticate_access_token_sqlite(
+    conn: sqlite3.Connection,
+    raw_access_token: str,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """
+    Verifies an access JWT against HS256 signature, expiry, cache blocklist, and
+    `orders_authsessiontoken` in SQLite, returning the server-resolved `/api/v1/auth/me/` payload.
+    """
+    ensure_sqlite_auth_schema(conn)
+    if not isinstance(raw_access_token, str) or not raw_access_token.strip():
+        raise AuthenticationBoundaryError(GENERIC_INVALID_ACCESS_TOKEN_MESSAGE)
+
+    effective_now = now or timezone.now()
+    cleaned = raw_access_token.strip()
+    if cleaned.lower().startswith('bearer '):
+        cleaned = cleaned[7:].strip()
+    elif cleaned.lower().startswith('token '):
+        cleaned = cleaned[6:].strip()
+
+    jwt_claims = decode_and_verify_jwt(
+        cleaned,
+        expected_type='access',
+        verify_exp=False,
+        now=effective_now,
+    )
+    exp_claim = jwt_claims.get('exp')
+    jwt_expired = not isinstance(exp_claim, (int, float)) or effective_now.timestamp() >= float(exp_claim)
+    token_hash = hash_opaque_token(cleaned)
+
+    if is_token_blocklisted(
+        cleaned,
+        token_hash=token_hash,
+        jti=jwt_claims.get('jti'),
+        token_family_id=jwt_claims.get('family_id'),
+    ):
+        raise AuthenticationBoundaryError(GENERIC_INVALID_ACCESS_TOKEN_MESSAGE)
+
+    row = conn.execute(
+        """
+        SELECT id, user_id, token_family_id, access_token_hash, refresh_token_hash,
+               access_expires_at, revoked_at
+        FROM orders_authsessiontoken
+        WHERE access_token_hash = ?
+        """,
+        (token_hash,),
+    ).fetchone()
+    if row is None:
+        raise AuthenticationBoundaryError(GENERIC_INVALID_ACCESS_TOKEN_MESSAGE)
+
+    tok_id, user_id, _fam_id, acc_hash, ref_hash, acc_exp_str, revoked_at = row
+    if revoked_at is not None:
+        blocklist_token_hashes(access_token_hashes=[acc_hash], refresh_token_hashes=[ref_hash])
+        raise AuthenticationBoundaryError(GENERIC_INVALID_ACCESS_TOKEN_MESSAGE)
+
+    acc_exp_dt = datetime.fromisoformat(acc_exp_str)
+    if jwt_expired or effective_now >= acc_exp_dt:
+        conn.execute(
+            """
+            UPDATE orders_authsessiontoken
+            SET revoked_at = ?, revocation_reason = 'EXPIRED'
+            WHERE id = ?
+            """,
+            (effective_now.isoformat(), tok_id),
+        )
+        conn.commit()
+        blocklist_token_hashes(access_token_hashes=[acc_hash], reason='EXPIRED')
+        raise AuthenticationBoundaryError(GENERIC_INVALID_ACCESS_TOKEN_MESSAGE)
+
+    user_meta, actor = _resolve_actor_sqlite(conn, int(user_id))
+    conn.execute(
+        'UPDATE orders_authsessiontoken SET last_used_at = ? WHERE id = ?',
+        (effective_now.isoformat(), tok_id),
+    )
+    conn.commit()
+
+    return {
+        'actor_id': actor.actor_id,
+        'username': user_meta['username'],
+        'email': user_meta['email'],
+        'full_name': user_meta['full_name'],
+        'phone_number': user_meta['phone_number'],
+        'role': actor.role,
+        'customer_id': actor.customer_id,
+        'store_id': user_meta['store_id'],
+        'authorized_branch_ids': (
+            sorted(actor.authorized_branch_ids)
+            if actor.authorized_branch_ids is not None
+            else None
+        ),
+    }
+
+
+def revoke_token_session_sqlite(
+    conn: sqlite3.Connection,
+    raw_access_token: str,
+    *,
+    all_devices: bool = False,
+    now: datetime | None = None,
+) -> None:
+    """
+    Authenticates `raw_access_token` and immediately revokes & blocklists the active token
+    session family (or all user sessions if `all_devices=True`) in SQLite and cache.
+    """
+    me_info = authenticate_access_token_sqlite(conn, raw_access_token, now=now)
+    effective_now = now or timezone.now()
+    cleaned = raw_access_token.strip()
+    if cleaned.lower().startswith('bearer '):
+        cleaned = cleaned[7:].strip()
+    elif cleaned.lower().startswith('token '):
+        cleaned = cleaned[6:].strip()
+    token_hash = hash_opaque_token(cleaned)
+    user_id = int(str(me_info['actor_id']).split(':')[1])
+
+    row = conn.execute(
+        'SELECT token_family_id FROM orders_authsessiontoken WHERE access_token_hash = ?',
+        (token_hash,),
+    ).fetchone()
+    family_id = row[0] if row else ''
+
+    if all_devices or not family_id:
+        rows = conn.execute(
+            'SELECT access_token_hash, refresh_token_hash, token_family_id FROM orders_authsessiontoken WHERE user_id = ? AND revoked_at IS NULL',
+            (user_id,),
+        ).fetchall()
+        conn.execute(
+            """
+            UPDATE orders_authsessiontoken
+            SET revoked_at = ?, revocation_reason = 'LOGOUT'
+            WHERE user_id = ? AND revoked_at IS NULL
+            """,
+            (effective_now.isoformat(), user_id),
+        )
+    else:
+        rows = conn.execute(
+            'SELECT access_token_hash, refresh_token_hash, token_family_id FROM orders_authsessiontoken WHERE user_id = ? AND token_family_id = ? AND revoked_at IS NULL',
+            (user_id, family_id),
+        ).fetchall()
+        conn.execute(
+            """
+            UPDATE orders_authsessiontoken
+            SET revoked_at = ?, revocation_reason = 'LOGOUT'
+            WHERE user_id = ? AND token_family_id = ? AND revoked_at IS NULL
+            """,
+            (effective_now.isoformat(), user_id, family_id),
+        )
+    conn.commit()
+
+    blocklist_token_hashes(
+        access_token_hashes=[r[0] for r in rows],
+        refresh_token_hashes=[r[1] for r in rows],
+        reason='LOGOUT',
+    )
+    for fam in {r[2] for r in rows if r[2]}:
+        blocklist_token_family(fam, reason='LOGOUT')
+    cache.delete(f"{CACHE_PREFIX_USER_SESSION}{user_id}")
+

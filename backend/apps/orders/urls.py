@@ -4,6 +4,7 @@ from .views import (
     AuthLoginView,
     AuthLogoutView,
     AuthMeView,
+    AuthRegisterView,
     AuthTokenRefreshView,
     OrderViewSet,
 )
@@ -12,6 +13,7 @@ router = DefaultRouter()
 router.register(r'orders', OrderViewSet, basename='order')
 
 urlpatterns = [
+    path('auth/register/', AuthRegisterView.as_view(), name='auth-register'),
     path('auth/login/', AuthLoginView.as_view(), name='auth-login'),
     path('auth/token/', AuthLoginView.as_view(), name='auth-token'),
     path('auth/refresh/', AuthTokenRefreshView.as_view(), name='auth-refresh'),
@@ -21,4 +23,5 @@ urlpatterns = [
     path('auth/logout/', AuthLogoutView.as_view(), name='auth-logout'),
     path('', include(router.urls)),
 ]
+
 

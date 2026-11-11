@@ -111,9 +111,12 @@ class OrderRepository(
     private val cartDao: CartDao = database.cartDao(),
     private val orderDao: OrderDao = database.orderDao(),
     private val orderItemDao: OrderItemDao = database.orderItemDao(),
-    private val stockAdjustmentDao: StockAdjustmentDao = database.stockAdjustmentDao()
+    private val stockAdjustmentDao: StockAdjustmentDao = database.stockAdjustmentDao(),
+    private val checkoutMutex: Mutex = Mutex()
 ) {
-    private val checkoutMutex = Mutex()
+    internal val synchronizationMutex: Mutex
+        get() = checkoutMutex
+
     private val completedIdempotencyKeys = mutableSetOf<String>()
     private val restoredOrderIds = mutableSetOf<Int>()
 

@@ -76,8 +76,13 @@ class AuthViewModel(
         val result = authRepository.signInWithDemoRole(role)
         _isLoading.value = false
 
-        if (result is AuthOperationResult.Success) {
-            onAuthenticated(result.destination)
+        when (result) {
+            is AuthOperationResult.Success -> {
+                onAuthenticated(result.destination)
+            }
+            is AuthOperationResult.Error -> {
+                _errorMessage.value = result.messageArabic
+            }
         }
         return result
     }

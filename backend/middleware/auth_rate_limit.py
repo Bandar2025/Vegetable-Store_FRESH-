@@ -8,14 +8,98 @@ from __future__ import annotations
 
 import ipaddress
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Callable
 
-from django.conf import settings
-from django.core.cache import cache
-from django.http import HttpRequest, JsonResponse
-from django.utils import timezone
-from rest_framework import status
+try:
+    from django.conf import settings
+    from django.core.cache import cache
+    from django.http import HttpRequest, JsonResponse
+    from django.utils import timezone
+    from rest_framework import status
+
+    DJANGO_AVAILABLE = True
+except ImportError:
+    DJANGO_AVAILABLE = False
+
+    class _FallbackSettings:
+        SECRET_KEY = 'local-dev-only-f9a8b7c6d5e4f3a2b1c09876543210fedcba9876543210fedcba9876543210'
+        AUTH_JWT_SIGNING_KEY = SECRET_KEY
+        AUTH_JWT_ALGORITHM = 'HS256'
+        AUTH_JWT_ISSUER = 'fresh-backend'
+        AUTH_ACCESS_TOKEN_TTL_SECONDS = 900
+        AUTH_REFRESH_TOKEN_TTL_SECONDS = 604800
+        AUTH_MAX_FAILED_LOGIN_ATTEMPTS = 5
+        AUTH_FAILED_LOGIN_WINDOW_SECONDS = 300
+        AUTH_LOGIN_RATE_LIMIT_REQUESTS = 15
+        AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60
+        AUTH_REFRESH_RATE_LIMIT_REQUESTS = 10
+        AUTH_REFRESH_RATE_LIMIT_WINDOW_SECONDS = 60
+        TRUST_X_FORWARDED_FOR = False
+        TRUSTED_PROXY_IPS = ()
+
+    class _FallbackCache:
+        def __init__(self):
+            self._store: dict[str, object] = {}
+
+        def get(self, key: str, default=None):
+            return self._store.get(key, default)
+
+        def set(self, key: str, value: object, timeout: int | None = None) -> None:
+            self._store[key] = value
+
+        def delete(self, key: str) -> None:
+            self._store.pop(key, None)
+
+        def delete_many(self, keys) -> None:
+            for k in keys:
+                self._store.pop(k, None)
+
+        def clear(self) -> None:
+            self._store.clear()
+
+    class _FallbackTimezone:
+        @staticmethod
+        def now() -> datetime:
+            return datetime.now(dt_timezone.utc)
+
+    class HttpRequest:  # type: ignore[no-redef]
+        def __init__(self, method: str = 'POST', path: str = '', meta: dict | None = None, body: bytes = b''):
+            self.method = method
+            self.path = path
+            self.path_info = path
+            self.META = meta or {}
+            self.body = body
+
+    class JsonResponse(dict):  # type: ignore[no-redef]
+        def __init__(self, data: dict, status: int = 200, headers: dict | None = None):
+            super().__init__(data)
+            self.data = data
+            self.status_code = status
+            self.headers: dict[str, str] = dict(headers or {})
+
+        def __setitem__(self, key: str, value: object) -> None:
+            if isinstance(key, str) and key.lower() == 'retry-after':
+                self.headers[key] = str(value)
+            super().__setitem__(key, value)
+
+        def __contains__(self, key: object) -> bool:
+            if isinstance(key, str) and key in self.headers:
+                return True
+            return super().__contains__(key)
+
+    class _FallbackStatus:
+        HTTP_200_OK = 200
+        HTTP_201_CREATED = 201
+        HTTP_400_BAD_REQUEST = 400
+        HTTP_401_UNAUTHORIZED = 401
+        HTTP_403_FORBIDDEN = 403
+        HTTP_429_TOO_MANY_REQUESTS = 429
+
+    settings = _FallbackSettings()
+    cache = _FallbackCache()
+    timezone = _FallbackTimezone()
+    status = _FallbackStatus()
 
 CACHE_PREFIX_RL_LOGIN_FAIL_IP = 'auth:ratelimit:login_fail:ip:'
 CACHE_KEY_RL_TRACKED_KEYS = 'auth:ratelimit:tracked_keys'
@@ -25,6 +109,8 @@ LOGIN_RATE_LIMITED_PATHS = frozenset({
     '/api/v1/auth/login',
     '/api/v1/auth/token/',
     '/api/v1/auth/token',
+    '/api/v1/auth/register/',
+    '/api/v1/auth/register',
 })
 
 REFRESH_RATE_LIMITED_PATHS = frozenset({
@@ -39,6 +125,7 @@ REFRESH_RATE_LIMITED_PATHS = frozenset({
 LOGIN_ENDPOINT_URL_NAMES = frozenset({
     'auth-login',
     'auth-token',
+    'auth-register',
     'login',
 })
 
@@ -294,7 +381,7 @@ class AuthRateLimitMiddleware:
         if path in LOGIN_RATE_LIMITED_PATHS:
             return True
         normalized = path.rstrip('/')
-        if normalized in ('/api/v1/auth/login', '/api/v1/auth/token'):
+        if normalized in ('/api/v1/auth/login', '/api/v1/auth/token', '/api/v1/auth/register'):
             return True
         try:
             from django.urls import resolve

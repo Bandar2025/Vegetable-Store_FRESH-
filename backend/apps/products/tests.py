@@ -526,3 +526,429 @@ class ProductsDjangoModelTests(DjangoTestCase):
                         "DELETE FROM products_stockmovement WHERE id = %s",
                         [movement.pk],
                     )
+
+
+class ProductsGuestCatalogAndPermissionVerificationTests(unittest.TestCase):
+    """
+    Microtask 1B verification suite executing directly in the Python test runner:
+    1. Unauthenticated GET/HEAD/OPTIONS on products and categories are permitted for public guest browsing.
+    2. Unauthenticated POST/PUT/PATCH/DELETE are strictly rejected.
+    3. Authenticated CUSTOMER POST/PUT/PATCH/DELETE are rejected with PermissionDenied (403).
+    4. BRANCH_MANAGER and OWNER retain authorized branch access via `branch_id` and are blocked from cross-branch/cross-store access.
+    5. Unauthenticated guests are blocked from passing `branch_id`, `branch`, `store_id`, or identity-spoofing headers/params, preventing private branch override leakage.
+    6. CategorySerializer and ProductSerializer expose only public catalog fields and never expose internal WarehouseStockBalance or StockMovement fields.
+    """
+
+    def setUp(self):
+        from apps.orders.permissions import (
+            PermissionDenied,
+            PublicCatalogReadOrBranchManagerOwnerWritePermission,
+        )
+        from apps.orders.services import ActorRole, ServiceActor
+        from apps.products.views import (
+            CategoryViewSet,
+            ProductViewSet,
+            resolve_catalog_branch_context,
+        )
+
+        self.PermissionDenied = PermissionDenied
+        self.permission = PublicCatalogReadOrBranchManagerOwnerWritePermission()
+        self.CategoryViewSet = CategoryViewSet
+        self.ProductViewSet = ProductViewSet
+        self.resolve_catalog_branch_context = resolve_catalog_branch_context
+
+        self.conn = sqlite3.connect(':memory:')
+        create_products_sqlite_schema(self.conn)
+        self.conn.execute(
+            "INSERT INTO products_store (id, code, name, is_active) VALUES (1, 'FRESH-KSA', 'فريش السعودية', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_store (id, code, name, is_active) VALUES (2, 'FRESH-EAST', 'فريش الشرقية', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (1, 1, 'RUH-01', 'فرع الرياض', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (2, 1, 'JED-01', 'فرع جدة', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (3, 2, 'DMM-01', 'فرع الدمام', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (4, 1, 'INACTIVE-01', 'فرع متوقف', 0)"
+        )
+
+        self.customer_actor = ServiceActor(
+            actor_id='user:101',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-101',
+            authorized_branch_ids=None,
+        )
+        self.manager_b1_actor = ServiceActor(
+            actor_id='user:201',
+            role=ActorRole.BRANCH_MANAGER.value,
+            customer_id=None,
+            authorized_branch_ids=frozenset({1}),
+        )
+        self.owner_s1_actor = ServiceActor(
+            actor_id='user:301',
+            role=ActorRole.OWNER.value,
+            customer_id=None,
+            authorized_branch_ids=frozenset({1, 2}),
+        )
+
+    def tearDown(self):
+        self.conn.close()
+
+    @staticmethod
+    def _make_request(
+        method: str = 'GET',
+        *,
+        is_authenticated: bool = False,
+        actor=None,
+        query_params: dict | None = None,
+        headers: dict | None = None,
+    ):
+        class _DummyUser:
+            def __init__(self, authenticated: bool):
+                self.is_authenticated = authenticated
+                self.is_active = authenticated
+
+        class _DummyRequest:
+            pass
+
+        req = _DummyRequest()
+        req.method = method
+        req.user = _DummyUser(is_authenticated) if is_authenticated else None
+        req.query_params = dict(query_params or {})
+        req.GET = dict(query_params or {})
+        req.headers = dict(headers or {})
+        req.META = {}
+        if actor is not None:
+            req._resolved_service_actor = actor
+        return req
+
+    def _sqlite_branch_lookup(self, branch_id: int):
+        row = self.conn.execute(
+            """
+            SELECT b.id, b.code, b.name, b.is_active, s.id, s.is_active
+            FROM products_branch b
+            JOIN products_store s ON s.id = b.store_id
+            WHERE b.id = ? AND b.is_active = 1 AND s.is_active = 1
+            """,
+            (branch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {'id': row[0], 'code': row[1], 'name': row[2], 'is_active': bool(row[3])}
+
+    def test_01_viewsets_configured_with_public_catalog_read_permission_and_readonly_base(self):
+        self.assertEqual(
+            self.CategoryViewSet.permission_classes,
+            [type(self.permission)],
+        )
+        self.assertEqual(
+            self.ProductViewSet.permission_classes,
+            [type(self.permission)],
+        )
+
+        serializers_path = BACKEND_ROOT / 'apps' / 'products' / 'serializers.py'
+        serializers_src = serializers_path.read_text(encoding='utf-8')
+        # Verify internal stock/warehouse tables are never serialized in public catalog responses
+        for forbidden_internal_field in (
+            'on_hand_milli',
+            'reserved_milli',
+            'warehouse_stock_balances',
+            'stock_movements',
+            'override_price_halalas',
+        ):
+            self.assertNotIn(f"'{forbidden_internal_field}'", serializers_src)
+
+    def test_02_unauthenticated_guest_get_head_options_succeed_on_products_and_categories(self):
+        for view_cls in (self.CategoryViewSet, self.ProductViewSet):
+            view = view_cls()
+            for safe_method in ('GET', 'HEAD', 'OPTIONS'):
+                req = self._make_request(safe_method, is_authenticated=False)
+                self.assertTrue(
+                    self.permission.has_permission(req, view),
+                    f"Guest {safe_method} should be permitted on {view_cls.__name__}",
+                )
+
+    def test_03_unauthenticated_post_put_patch_delete_are_rejected(self):
+        for view_cls in (self.CategoryViewSet, self.ProductViewSet):
+            view = view_cls()
+            for unsafe_method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+                req = self._make_request(unsafe_method, is_authenticated=False)
+                self.assertFalse(
+                    self.permission.has_permission(req, view),
+                    f"Unauthenticated {unsafe_method} must be rejected on {view_cls.__name__}",
+                )
+
+    def test_04_authenticated_customer_cannot_execute_post_put_patch_delete(self):
+        for view_cls in (self.CategoryViewSet, self.ProductViewSet):
+            view = view_cls()
+            for unsafe_method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+                req = self._make_request(
+                    unsafe_method,
+                    is_authenticated=True,
+                    actor=self.customer_actor,
+                )
+                with self.assertRaises(self.PermissionDenied):
+                    self.permission.has_permission(req, view)
+
+    def test_05_branch_manager_and_store_owner_permissions_and_branch_scope_enforced(self):
+        view = self.ProductViewSet()
+
+        # Branch manager of Branch 1 can read Branch 1 overrides, but is blocked from Branch 2
+        mgr_req_b1 = self._make_request(
+            'GET',
+            is_authenticated=True,
+            actor=self.manager_b1_actor,
+            query_params={'branch_id': '1'},
+        )
+        self.assertTrue(self.permission.has_permission(mgr_req_b1, view))
+        resolved_b1 = self.resolve_catalog_branch_context(
+            mgr_req_b1,
+            branch_lookup=self._sqlite_branch_lookup,
+        )
+        self.assertEqual(resolved_b1['id'], 1)
+
+        mgr_req_b2 = self._make_request(
+            'GET',
+            is_authenticated=True,
+            actor=self.manager_b1_actor,
+            query_params={'branch_id': '2'},
+        )
+        with self.assertRaises(self.PermissionDenied):
+            self.resolve_catalog_branch_context(
+                mgr_req_b2,
+                branch_lookup=self._sqlite_branch_lookup,
+            )
+
+        # Store owner of Store 1 can access Branch 1 and Branch 2, but is blocked from Store 2's Branch 3
+        for allowed_branch_id in (1, 2):
+            owner_req = self._make_request(
+                'GET',
+                is_authenticated=True,
+                actor=self.owner_s1_actor,
+                query_params={'branch_id': str(allowed_branch_id)},
+            )
+            self.assertTrue(self.permission.has_permission(owner_req, view))
+            resolved = self.resolve_catalog_branch_context(
+                owner_req,
+                branch_lookup=self._sqlite_branch_lookup,
+            )
+            self.assertEqual(resolved['id'], allowed_branch_id)
+
+        owner_req_b3 = self._make_request(
+            'GET',
+            is_authenticated=True,
+            actor=self.owner_s1_actor,
+            query_params={'branch_id': '3'},
+        )
+        with self.assertRaises(self.PermissionDenied):
+            self.resolve_catalog_branch_context(
+                owner_req_b3,
+                branch_lookup=self._sqlite_branch_lookup,
+            )
+
+    def test_06_private_branch_data_and_spoofing_blocked_for_unauthenticated_guests(self):
+        view = self.ProductViewSet()
+
+        # Guest attempting to query branch_id or store_id or spoof role is rejected at permission & context layers
+        for restricted_params in (
+            {'branch_id': '1'},
+            {'branch': '1'},
+            {'store_id': '1'},
+            {'role': 'OWNER'},
+            {'actor_id': 'user:1'},
+        ):
+            guest_req = self._make_request(
+                'GET',
+                is_authenticated=False,
+                query_params=restricted_params,
+            )
+            self.assertFalse(
+                self.permission.has_permission(guest_req, view),
+                f"Guest request with {restricted_params} must be rejected",
+            )
+
+        guest_branch_req = self._make_request(
+            'GET',
+            is_authenticated=False,
+            query_params={'branch_id': '1'},
+        )
+        with self.assertRaises(self.PermissionDenied):
+            self.resolve_catalog_branch_context(
+                guest_branch_req,
+                branch_lookup=self._sqlite_branch_lookup,
+            )
+
+        # Guest without branch_id gets None branch context (public base catalog only)
+        public_guest_req = self._make_request('GET', is_authenticated=False)
+        self.assertIsNone(
+            self.resolve_catalog_branch_context(
+                public_guest_req,
+                branch_lookup=self._sqlite_branch_lookup,
+            )
+        )
+
+
+@unittest.skipUnless(
+    DJANGO_AVAILABLE,
+    "Django ORM & DRF runtime are not installed in the Android build container; requires Django test runner.",
+)
+class ProductsGuestCatalogAndPermissionDRFTests(DjangoTestCase):
+    """
+    Full DRF APIClient integration tests for Microtask 1B:
+    1. GET /api/v1/products/ without JWT succeeds (200 OK) with real ProductSerializer output.
+    2. GET /api/v1/categories/ without JWT succeeds (200 OK) with real CategorySerializer output.
+    3. POST without authentication is rejected (401 Unauthorized).
+    4. PUT, PATCH, DELETE without permissions are rejected (401 for unauthenticated, 403 for customer).
+    5. Branch Manager and Store Owner permissions and branch_id isolation work as designed.
+    6. Private branch overrides and inactive products/categories are never leaked to guests.
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+        from rest_framework.test import APIClient
+        from apps.orders.auth import create_user_with_identity_profile
+        from apps.orders.models import UserIdentityProfile
+
+        cache.clear()
+        self.client_guest = APIClient()
+
+        self.store_1 = Store.objects.create(code='FRESH-KSA', name='فريش السعودية', is_active=True)
+        self.branch_1 = Branch.objects.create(store=self.store_1, code='RUH-01', name='فرع الرياض', is_active=True)
+        self.branch_2 = Branch.objects.create(store=self.store_1, code='JED-01', name='فرع جدة', is_active=True)
+
+        self.store_2 = Store.objects.create(code='FRESH-EAST', name='فريش الشرقية', is_active=True)
+        self.branch_3 = Branch.objects.create(store=self.store_2, code='DMM-01', name='فرع الدمام', is_active=True)
+
+        self.cat_active = Category.objects.create(name='فواكه', display_order=1, is_active=True)
+        self.cat_inactive = Category.objects.create(name='تصنيف مخفي', display_order=2, is_active=False)
+
+        self.prod_active = Product.objects.create(
+            sku='SKU-APPLE-1',
+            barcode='6281000000101',
+            name='تفاح أحمر جالا',
+            category=self.cat_active,
+            price_halalas=650,
+            description='تفاح طازج',
+            image_url='apple',
+            unit='كيلوجرام',
+            is_fractional_allowed=True,
+            is_active=True,
+        )
+        self.prod_inactive = Product.objects.create(
+            sku='SKU-HIDDEN-1',
+            name='منتج غير نشط',
+            category=self.cat_active,
+            price_halalas=900,
+            unit='حبة',
+            is_active=False,
+        )
+
+        # Private branch price override in Branch 1 (550 halalas instead of base 650 halalas)
+        BranchProductOverride.objects.create(
+            branch=self.branch_1,
+            product=self.prod_active,
+            override_price_halalas=550,
+            is_available=True,
+        )
+
+        self.cust_user, _ = create_user_with_identity_profile(
+            username='guest_test_customer',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.CUSTOMER,
+            customer_id='cust-guest-test-1',
+        )
+        self.mgr_b1_user, _ = create_user_with_identity_profile(
+            username='guest_test_mgr_b1',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.BRANCH_MANAGER,
+            store=self.store_1,
+            branches=[self.branch_1],
+        )
+        self.owner_s1_user, _ = create_user_with_identity_profile(
+            username='guest_test_owner_s1',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.OWNER,
+            store=self.store_1,
+        )
+
+    def _login(self, username: str):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        res = client.post(
+            '/api/v1/auth/login/',
+            {'username': username, 'password': 'SafePassword#2026!'},
+            format='json',
+        )
+        self.assertEqual(res.status_code, 200)
+        client.credentials(HTTP_AUTHORIZATION=f"Token {res.data['token']}")
+        return client
+
+    def test_guest_get_products_and_categories_and_write_protection(self):
+        # 1 & 2. Guest GET on products and categories succeeds without JWT
+        cat_res = self.client_guest.get('/api/v1/categories/')
+        self.assertEqual(cat_res.status_code, 200)
+        self.assertEqual(len(cat_res.data), 1)
+        self.assertEqual(cat_res.data[0]['name'], 'فواكه')
+
+        prod_res = self.client_guest.get('/api/v1/products/')
+        self.assertEqual(prod_res.status_code, 200)
+        self.assertEqual(len(prod_res.data), 1)
+        # Guest sees public base price (650), not Branch 1's private override (550)
+        self.assertEqual(prod_res.data[0]['price_halalas'], 650)
+        self.assertEqual(prod_res.data[0]['effective_price_halalas'], 650)
+
+        # HEAD and OPTIONS also succeed for guests
+        self.assertEqual(self.client_guest.head('/api/v1/products/').status_code, 200)
+        self.assertEqual(self.client_guest.options('/api/v1/products/').status_code, 200)
+
+        # 3 & 4. POST, PUT, PATCH, DELETE without auth are rejected (401), and for customer are rejected (403)
+        for url in ('/api/v1/products/', '/api/v1/categories/'):
+            self.assertEqual(self.client_guest.post(url, {}, format='json').status_code, 401)
+
+        detail_url = f'/api/v1/products/{self.prod_active.id}/'
+        self.assertEqual(self.client_guest.put(detail_url, {}, format='json').status_code, 401)
+        self.assertEqual(self.client_guest.patch(detail_url, {}, format='json').status_code, 401)
+        self.assertEqual(self.client_guest.delete(detail_url).status_code, 401)
+
+        cust_client = self._login('guest_test_customer')
+        self.assertEqual(cust_client.post('/api/v1/products/', {}, format='json').status_code, 403)
+        self.assertEqual(cust_client.put(detail_url, {}, format='json').status_code, 403)
+        self.assertEqual(cust_client.patch(detail_url, {}, format='json').status_code, 403)
+        self.assertEqual(cust_client.delete(detail_url).status_code, 403)
+
+        # 5 & 6. Guest probing branch_id is rejected; Branch Manager & Owner branch isolation works
+        self.assertEqual(
+            self.client_guest.get(f'/api/v1/products/?branch_id={self.branch_1.id}').status_code,
+            401,
+        )
+
+        mgr_client = self._login('guest_test_mgr_b1')
+        mgr_b1_res = mgr_client.get(f'/api/v1/products/?branch_id={self.branch_1.id}')
+        self.assertEqual(mgr_b1_res.status_code, 200)
+        self.assertEqual(mgr_b1_res.data[0]['effective_price_halalas'], 550)
+        self.assertEqual(
+            mgr_client.get(f'/api/v1/products/?branch_id={self.branch_2.id}').status_code,
+            403,
+        )
+
+        owner_client = self._login('guest_test_owner_s1')
+        self.assertEqual(
+            owner_client.get(f'/api/v1/products/?branch_id={self.branch_1.id}').status_code,
+            200,
+        )
+        self.assertEqual(
+            owner_client.get(f'/api/v1/products/?branch_id={self.branch_2.id}').status_code,
+            200,
+        )
+        self.assertEqual(
+            owner_client.get(f'/api/v1/products/?branch_id={self.branch_3.id}').status_code,
+            403,
+        )
+
