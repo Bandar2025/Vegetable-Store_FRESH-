@@ -1,0 +1,64 @@
+# Root Docker Compose Configuration for FRESH PostgreSQL Service & Certification (Microtask 1D.2.1 / 1D.2.2)
+# Configured with the database environment variables specified in backend/.env.example:
+#   DB_NAME=fresh_db
+#   DB_USER=fresh_user
+#   DB_PASSWORD=...
+# Usage:
+#   docker compose up -d postgres
+#   bash backend/scripts/run_postgres_certification.sh
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fresh_postgres
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env.example
+    environment:
+      DB_NAME: ${DB_NAME:-fresh_db}
+      DB_USER: ${DB_USER:-fresh_user}
+      DB_PASSWORD: ${DB_PASSWORD:-fresh_dev_password}
+      POSTGRES_DB: ${DB_NAME:-fresh_db}
+      POSTGRES_USER: ${DB_USER:-fresh_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-fresh_dev_password}
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-fresh_user} -d $${POSTGRES_DB:-fresh_db}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  django-certification:
+    image: python:3.11-slim
+    working_dir: /workspace/backend
+    volumes:
+      - ./:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DJANGO_ENV: test
+      DEBUG: "True"
+      SECRET_KEY: "Fresh_PgCert_Test_Key_2026_High_Entropy_9876543210_AbCdEfGhIjKlMnOpQrStUvWxYz"
+      ALLOWED_HOSTS: "127.0.0.1,localhost,testserver"
+      DB_ENGINE: django.db.backends.postgresql
+      DB_NAME: ${DB_NAME:-fresh_db}
+      DB_USER: ${DB_USER:-fresh_user}
+      DB_PASSWORD: ${DB_PASSWORD:-fresh_dev_password}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y --no-install-recommends libpq-dev gcc postgresql-client &&
+        pip install --no-cache-dir -r requirements.txt &&
+        bash scripts/run_postgres_certification.sh
+      "
+
+volumes:
+  postgres_data:

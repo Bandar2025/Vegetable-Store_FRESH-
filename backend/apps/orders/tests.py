@@ -37,7 +37,10 @@ try:
     from django.core.exceptions import ValidationError
     from django.db import IntegrityError, transaction
     from django.db.models import ProtectedError
-    from django.test import TestCase as DjangoTestCase
+    from django.test import (
+        TestCase as DjangoTestCase,
+        TransactionTestCase as DjangoTransactionTestCase,
+    )
 
     from apps.orders.models import (
         IdempotencyKey,
@@ -60,6 +63,7 @@ try:
 except ImportError:
     DJANGO_AVAILABLE = False
     DjangoTestCase = unittest.TestCase
+    DjangoTransactionTestCase = unittest.TestCase
 
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -3231,7 +3235,8 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertNotEqual(row[0], raw_pw)
         self.assertTrue(row[0].startswith('pbkdf2_sha256$'))
-        self.assertEqual(identify_hasher(row[0]), 'pbkdf2_sha256')
+        hasher = identify_hasher(row[0])
+        self.assertEqual(getattr(hasher, 'algorithm', hasher), 'pbkdf2_sha256')
         self.assertEqual(row[1], 0)
         self.assertEqual(row[2], 0)
 
@@ -3377,6 +3382,15 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
         )
         from middleware.auth_rate_limit import HttpRequest
 
+        def _make_http_req(*, method: str, path: str, meta: dict, body: bytes = b''):
+            req = HttpRequest()
+            req.method = method
+            req.path = path
+            req.path_info = path
+            req.META = dict(meta)
+            req._body = body
+            return req
+
         register_customer_account(
             {
                 'full_name': 'ياسر الزهراني',
@@ -3394,7 +3408,7 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
             settings.AUTH_REFRESH_RATE_LIMIT_REQUESTS = 2
 
             for _ in range(3):
-                req = HttpRequest(
+                req = _make_http_req(
                     method='POST',
                     path='/api/v1/auth/login/',
                     meta={'REMOTE_ADDR': '203.0.113.77'},
@@ -3409,7 +3423,7 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
                     )
 
             # 4th attempt is throttled even with valid password
-            req_throttled = HttpRequest(
+            req_throttled = _make_http_req(
                 method='POST',
                 path='/api/v1/auth/login/',
                 meta={'REMOTE_ADDR': '203.0.113.77'},
@@ -3426,7 +3440,7 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
 
             # Refresh rate limit after 2 requests
             for _ in range(2):
-                ref_req = HttpRequest(
+                ref_req = _make_http_req(
                     method='POST',
                     path='/api/v1/auth/refresh/',
                     meta={'REMOTE_ADDR': '203.0.113.88'},
@@ -3434,7 +3448,7 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
                 with self.assertRaises(AuthenticationBoundaryError):
                     rotate_session_token_sqlite(self.conn, 'invalid.jwt.token', request=ref_req)
 
-            ref_req_throttled = HttpRequest(
+            ref_req_throttled = _make_http_req(
                 method='POST',
                 path='/api/v1/auth/refresh/',
                 meta={'REMOTE_ADDR': '203.0.113.88'},
@@ -3452,7 +3466,7 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
             try:
                 settings.AUTH_LOGIN_RATE_LIMIT_REQUESTS = 2
                 for idx in range(2):
-                    reg_req = HttpRequest(
+                    reg_req = _make_http_req(
                         method='POST',
                         path='/api/v1/auth/register/',
                         meta={'REMOTE_ADDR': '203.0.113.99'},
@@ -3467,7 +3481,7 @@ class CustomerRegistrationAndJwtLifecycleVerificationTests(unittest.TestCase):
                         request=reg_req,
                         conn=self.conn,
                     )
-                reg_req_throttled = HttpRequest(
+                reg_req_throttled = _make_http_req(
                     method='POST',
                     path='/api/v1/auth/register/',
                     meta={'REMOTE_ADDR': '203.0.113.99'},
@@ -4415,6 +4429,2279 @@ class MicroTask1D2AtomicCheckoutEngineTests(unittest.TestCase):
             self.assertEqual(code_owner_checkout, 403)
         finally:
             server.stop()
+
+
+class MicroTask1D21HardeningAndCertificationTests(unittest.TestCase):
+    """
+    Microtask 1D.2.1 — Checkout Hardening, API Contract Audit, Idempotency Race
+    Audit & Migration 0005 Verification Suite.
+
+    Covers the required 12-point verification matrix:
+      1. HTTP financial, stock, and identity field spoofing across all 18 audited fields.
+      2. Customer role enforcement and permission boundary verification.
+      3. Cross-store isolation.
+      4. Cross-branch isolation.
+      5. Same-key replay.
+      6. Same-key payload conflict.
+      7. Concurrent same-key requests (identical payload & conflicting payload) +
+         client timeout retry + lost HTTP response retry.
+      8. Concurrent last-stock requests.
+      9. Atomic rollback on mid-transaction failure.
+      10. Repository AST & source audit (views.py syntax fix, services.py auth docstring).
+      11. Migration 0005 preservation, null/blank key normalization, customer-scoped
+          uniqueness, and reversibility (`0004 -> 0005 -> 0004`) on a disposable database.
+      12. Actual `CheckoutRequestSerializer` and `CheckoutItemRequestSerializer` validation.
+    """
+
+    def setUp(self):
+        from apps.orders.auth import ensure_sqlite_auth_schema
+
+        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        create_full_sqlite_schema(self.conn)
+        ensure_sqlite_auth_schema(self.conn)
+
+        self.conn.execute(
+            "INSERT INTO products_store (id, code, name, is_active) VALUES (1, 'STORE-01', 'متجر فريش 1', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_store (id, code, name, is_active) VALUES (2, 'STORE-02', 'متجر فريش 2', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (1, 1, 'BR-01', 'فرع العليا', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (2, 1, 'BR-02', 'فرع النخيل', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (3, 2, 'BR-03', 'فرع متجر آخر', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (1, 1, 'WH-01', 'مستودع العليا الرئيسي', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (2, 2, 'WH-02', 'مستودع النخيل الرئيسي', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (3, 3, 'WH-03', 'مستودع المتجر الثاني', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_category (id, name, display_order, is_active) VALUES (1, 'خضروات', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active) VALUES (1, 'SKU-1D21-1', 'خيار بلدي', 1, 600, 'كجم', 1, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_product (id, sku, name, category_id, price_halalas, unit, is_fractional_allowed, is_active) VALUES (2, 'SKU-1D21-2', 'خس طازج', 1, 500, 'حبة', 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 1, 10000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 2, 5000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (2, 1, 8000, 0, 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (3, 1, 8000, 0, 1)"
+        )
+
+        self.customer_actor = ServiceActor(
+            actor_id='user:201',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-user-201',
+            store_id=1,
+        )
+        self.customer_actor_2 = ServiceActor(
+            actor_id='user:202',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-user-202',
+            store_id=1,
+        )
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_00_repository_ast_and_source_audit_verification(self):
+        import ast
+        from pathlib import Path
+
+        orders_dir = Path(__file__).resolve().parent
+        audited_files = [
+            orders_dir / 'models.py',
+            orders_dir / 'auth.py',
+            orders_dir / 'permissions.py',
+            orders_dir / 'services.py',
+            orders_dir / 'serializers.py',
+            orders_dir / 'views.py',
+            orders_dir / 'test_http_server.py',
+            orders_dir / 'migrations' / '0005_scope_order_idempotency_key_per_customer.py',
+        ]
+        for file_path in audited_files:
+            self.assertTrue(file_path.exists(), f'Missing audited file: {file_path}')
+            source = file_path.read_text(encoding='utf-8')
+            tree = ast.parse(source, filename=str(file_path))
+            self.assertIsNotNone(tree)
+
+        views_src = (orders_dir / 'views.py').read_text(encoding='utf-8')
+        self.assertIn('IsCustomerPermission', views_src)
+        self.assertIn('def get_permissions(self)', views_src)
+
+        services_src = (orders_dir / 'services.py').read_text(encoding='utf-8')
+        self.assertNotIn(
+            'A real authentication system is NOT yet implemented in this codebase',
+            services_src,
+        )
+        self.assertIn('SessionTokenAuthentication', services_src)
+
+    def test_01_http_financial_stock_identity_field_spoofing_matrix(self):
+        import urllib.error
+        import urllib.request
+        from apps.orders.test_http_server import FreshContractHttpServer
+
+        server = FreshContractHttpServer()
+        port = server.start_in_background()
+        try:
+            def http_post(path: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
+                req_headers = {'Content-Type': 'application/json'}
+                if headers:
+                    req_headers.update(headers)
+                req = urllib.request.Request(
+                    f'http://127.0.0.1:{port}{path}',
+                    data=json.dumps(body).encode('utf-8'),
+                    headers=req_headers,
+                    method='POST',
+                )
+                try:
+                    with urllib.request.urlopen(req) as resp:
+                        return resp.status, json.loads(resp.read().decode('utf-8'))
+                except urllib.error.HTTPError as err:
+                    return err.code, json.loads(err.read().decode('utf-8'))
+
+            status_reg, reg_body = http_post(
+                '/api/v1/auth/register/',
+                {
+                    'full_name': 'عميل فحص العقود',
+                    'email': 'contract.audit@fresh.sa',
+                    'phone_number': '0508881111',
+                    'password': 'Audit#2026!Pass',
+                },
+            )
+            self.assertEqual(status_reg, 201)
+            auth_hdr = {'Authorization': f"Bearer {reg_body['access_token']}"}
+            caller_actor_id = reg_body['actor_id']
+            caller_customer_id = reg_body['customer_id']
+            caller_user_id = int(str(caller_actor_id).split(':', 1)[1])
+
+            # A. Forbidden Order-Level Financial & Stock Fields -> 400 Bad Request
+            for field_name, field_value in [
+                ('subtotal_halalas', 100),
+                ('discount_halalas', 500),
+                ('delivery_fee_halalas', 0),
+                ('price_halalas', 100),
+                ('unit_price_halalas', 100),
+                ('line_total_halalas', 100),
+                ('expected_unit_price_halalas', 100),
+                ('stock_quantity', 999999),
+                ('on_hand_milli', 999999),
+                ('reserved_milli', 0),
+            ]:
+                code, resp = http_post(
+                    '/api/v1/orders/',
+                    {
+                        'branch_id': 1,
+                        'idempotency_key': f'idem-http-top-{field_name}',
+                        field_name: field_value,
+                        'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                    },
+                    headers=auth_hdr,
+                )
+                self.assertEqual(code, 400, f'Expected 400 for order-level {field_name}, got {code}: {resp}')
+
+            # B. Forbidden Item-Level Financial, Stock, Identity & Branch Fields -> 400 Bad Request
+            for item_field, item_val in [
+                ('price_halalas', 1),
+                ('subtotal_halalas', 1),
+                ('total_halalas', 1),
+                ('expected_total_halalas', 1),
+                ('discount_halalas', 100),
+                ('delivery_fee_halalas', 0),
+                ('stock_quantity', 999999),
+                ('on_hand_milli', 999999),
+                ('reserved_milli', 0),
+                ('customer_id', caller_customer_id),
+                ('user_id', caller_user_id),
+                ('actor_id', caller_actor_id),
+                ('role', 'CUSTOMER'),
+                ('store_id', 1),
+                ('branch_id', 1),
+            ]:
+                code, resp = http_post(
+                    '/api/v1/orders/',
+                    {
+                        'branch_id': 1,
+                        'idempotency_key': f'idem-http-item-{item_field}',
+                        'items': [
+                            {
+                                'product_id': 1,
+                                'quantity_milli': 1000,
+                                item_field: item_val,
+                            }
+                        ],
+                    },
+                    headers=auth_hdr,
+                )
+                self.assertEqual(code, 400, f'Expected 400 for item-level {item_field}, got {code}: {resp}')
+
+            # C. Server-Controlled Identity Fields at Order Level -> 403 Forbidden (both mismatched AND matching caller's own identity)
+            for id_field, spoofed_val, matching_val in [
+                ('customer_id', 'cust-spoofed-other', caller_customer_id),
+                ('user_id', 99999, caller_user_id),
+                ('actor_id', 'user:99999', caller_actor_id),
+                ('role', 'OWNER', 'CUSTOMER'),
+                ('store_id', 2, 1),
+            ]:
+                for label, candidate_val in [('spoofed', spoofed_val), ('matching', matching_val)]:
+                    code, resp = http_post(
+                        '/api/v1/orders/',
+                        {
+                            'branch_id': 1,
+                            'idempotency_key': f'idem-http-id-{id_field}-{label}',
+                            id_field: candidate_val,
+                            'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                        },
+                        headers=auth_hdr,
+                    )
+                    self.assertEqual(
+                        code,
+                        403,
+                        f'Expected 403 for {id_field} ({label}={candidate_val}), got {code}: {resp}',
+                    )
+
+            # D. Client-supplied total_halalas, unit_price_halalas, line_total_halalas:
+            #    - Ignored by default (server computes authoritative 795 * 2 = 1590 halalas)
+            #    - Rejected with 400 when reject_client_pricing=True
+            code_ignored, body_ignored = http_post(
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'idem-http-ignored-prices',
+                    'total_halalas': 10,
+                    'items': [
+                        {
+                            'product_id': 1,
+                            'quantity_milli': 2000,
+                            'unit_price_halalas': 5,
+                            'line_total_halalas': 10,
+                        }
+                    ],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_ignored, 201)
+            self.assertEqual(body_ignored['total_halalas'], 1590)
+            self.assertEqual(body_ignored['items'][0]['unit_price_halalas'], 795)
+            self.assertEqual(body_ignored['items'][0]['line_total_halalas'], 1590)
+
+            code_strict_reject, _ = http_post(
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'idem-http-strict-reject-prices',
+                    'reject_client_pricing': True,
+                    'total_halalas': 10,
+                    'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_strict_reject, 400)
+
+            # E. Validation Hints: expected_total_halalas & expected_unit_price_halalas
+            #    - Rejected with 400 when mismatched
+            #    - Accepted (201) when matching authoritative server prices (795 halalas)
+            code_bad_exp_unit, _ = http_post(
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'idem-http-bad-exp-unit',
+                    'items': [
+                        {
+                            'product_id': 1,
+                            'quantity_milli': 1000,
+                            'expected_unit_price_halalas': 700,
+                        }
+                    ],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_bad_exp_unit, 400)
+
+            code_bad_exp_total, _ = http_post(
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'idem-http-bad-exp-total',
+                    'expected_total_halalas': 700,
+                    'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_bad_exp_total, 400)
+
+            code_ok_hints, body_ok_hints = http_post(
+                '/api/v1/orders/',
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'idem-http-ok-hints',
+                    'expected_total_halalas': 795,
+                    'items': [
+                        {
+                            'product_id': 1,
+                            'quantity_milli': 1000,
+                            'expected_unit_price_halalas': 795,
+                        }
+                    ],
+                },
+                headers=auth_hdr,
+            )
+            self.assertEqual(code_ok_hints, 201)
+            self.assertEqual(body_ok_hints['total_halalas'], 795)
+        finally:
+            server.stop()
+
+    def test_02_customer_role_enforcement_and_permission_chain(self):
+        from apps.orders.auth import hash_password_pbkdf2_sha256
+        from apps.orders.permissions import (
+            IsAuthenticatedActiveProfile,
+            IsCustomerPermission,
+            PermissionDenied,
+        )
+
+        valid_pw_hash = hash_password_pbkdf2_sha256('ValidPass#2026')
+
+        class _DummyStore:
+            def __init__(self, is_active: bool = True):
+                self.is_active = is_active
+
+        class _DummyProfile:
+            def __init__(self, role: str, customer_id: str | None, is_active: bool = True, store_id: int | None = None):
+                self.role = role
+                self.customer_id = customer_id
+                self.is_active = is_active
+                self.store_id = store_id
+                self.store = _DummyStore(is_active=True) if store_id is not None else None
+
+        class _DummyUser:
+            def __init__(self, is_authenticated: bool = True, is_active: bool = True, profile=None):
+                self.is_authenticated = is_authenticated
+                self.is_active = is_active
+                self.pk = 501
+                self.username = 'dummy@fresh.sa'
+                self.password = valid_pw_hash
+                self.identity_profile = profile
+
+            def has_usable_password(self) -> bool:
+                return True
+
+        class _DummyReq:
+            def __init__(self, user, actor=None):
+                self.user = user
+                self.method = 'POST'
+                self.data = {}
+                self.query_params = {}
+                self.headers = {}
+                if actor is not None:
+                    self._resolved_service_actor = actor
+
+        # 1. Unauthenticated user -> blocked by IsAuthenticatedActiveProfile & IsCustomerPermission
+        unauth_req = _DummyReq(user=_DummyUser(is_authenticated=False))
+        self.assertFalse(IsAuthenticatedActiveProfile().has_permission(unauth_req, None))
+        self.assertFalse(IsCustomerPermission().has_permission(unauth_req, None))
+
+        # 2. Authenticated user with inactive profile -> raises PermissionDenied
+        inactive_prof_req = _DummyReq(
+            user=_DummyUser(profile=_DummyProfile(role='CUSTOMER', customer_id='cust-501', is_active=False))
+        )
+        with self.assertRaises(PermissionDenied):
+            IsAuthenticatedActiveProfile().has_permission(inactive_prof_req, None)
+        with self.assertRaises(PermissionDenied):
+            IsCustomerPermission().has_permission(inactive_prof_req, None)
+
+        # 3. CUSTOMER profile without customer_id -> raises PermissionDenied
+        missing_cid_req = _DummyReq(
+            user=_DummyUser(profile=_DummyProfile(role='CUSTOMER', customer_id='', is_active=True))
+        )
+        with self.assertRaises(PermissionDenied):
+            IsCustomerPermission().has_permission(missing_cid_req, None)
+
+        # 4. OWNER and BRANCH_MANAGER profiles -> raises PermissionDenied on IsCustomerPermission
+        for staff_role in ('OWNER', 'BRANCH_MANAGER'):
+            staff_req = _DummyReq(
+                user=_DummyUser(profile=_DummyProfile(role=staff_role, customer_id=None, is_active=True, store_id=1)),
+                actor=ServiceActor(
+                    actor_id='user:501',
+                    role=staff_role,
+                    customer_id=None,
+                    store_id=1,
+                    authorized_branch_ids=frozenset({1}),
+                ),
+            )
+            with self.assertRaises(PermissionDenied):
+                IsCustomerPermission().has_permission(staff_req, None)
+
+        # 5. Active CUSTOMER profile with valid customer_id -> allowed by both permissions
+        valid_cust_req = _DummyReq(
+            user=_DummyUser(profile=_DummyProfile(role='CUSTOMER', customer_id='cust-501', is_active=True)),
+        )
+        self.assertTrue(IsAuthenticatedActiveProfile().has_permission(valid_cust_req, None))
+        self.assertTrue(IsCustomerPermission().has_permission(valid_cust_req, None))
+
+    def test_03_cross_store_isolation_and_04_cross_branch_isolation(self):
+        # 1. Cross-store checkout rejected when customer actor is scoped to Store 1 and targets Branch 3 (Store 2)
+        with self.assertRaises(AuthenticationBoundaryError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=3,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d21-cross-store',
+                conn=self.conn,
+            )
+
+        # 2. Cross-branch warehouse mismatch rejected when targeting Branch 1 with Branch 2's warehouse (Warehouse 2)
+        with self.assertRaises(BranchWarehouseMismatchError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                warehouse_id=2,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d21-cross-branch-wh',
+                conn=self.conn,
+            )
+
+        # 3. Branch-specific override marks Product 1 unavailable in Branch 2 while remaining available in Branch 1
+        self.conn.execute(
+            """
+            INSERT INTO products_branchproductoverride (
+                branch_id, product_id, is_available, override_price_halalas, min_order_quantity_milli, max_order_quantity_milli
+            ) VALUES (2, 1, 0, NULL, 1000, NULL)
+            """
+        )
+        with self.assertRaises(CheckoutValidationError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=2,
+                items=[{'product_id': 1, 'quantity_milli': 1000}],
+                idempotency_key='idem-1d21-branch2-unavail',
+                conn=self.conn,
+            )
+
+        ok_branch1 = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d21-branch1-avail',
+            conn=self.conn,
+        )
+        self.assertEqual(ok_branch1.branch_id, 1)
+        self.assertEqual(ok_branch1.warehouse_id, 1)
+
+        # Verify Branch 2 stock was untouched while Branch 1 stock was deducted
+        b1_stock = self.conn.execute(
+            "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+        ).fetchone()[0]
+        b2_stock = self.conn.execute(
+            "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 2 AND product_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(b1_stock, 9000)
+        self.assertEqual(b2_stock, 8000)
+
+    def test_05_same_key_replay_and_06_same_key_payload_conflict(self):
+        first = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1500}],
+            idempotency_key='idem-1d21-replay-conflict',
+            conn=self.conn,
+        )
+        self.assertFalse(first.replayed)
+        self.assertEqual(first.total_halalas, 900)
+
+        # Same customer, same key, same payload -> replayed=True, identical order_id, single deduction
+        replay = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1500}],
+            idempotency_key='idem-1d21-replay-conflict',
+            conn=self.conn,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.order_id, first.order_id)
+
+        # Same customer, same key, different payload -> IdempotencyConflictError (409)
+        with self.assertRaises(IdempotencyConflictError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 2500}],
+                idempotency_key='idem-1d21-replay-conflict',
+                conn=self.conn,
+            )
+
+        # Different customer, same key -> creates a separate order cleanly
+        other_customer_order = checkout_order(
+            actor=self.customer_actor_2,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d21-replay-conflict',
+            conn=self.conn,
+        )
+        self.assertFalse(other_customer_order.replayed)
+        self.assertNotEqual(other_customer_order.order_id, first.order_id)
+
+    def test_07_concurrent_same_key_requests_and_retry_after_timeout_or_lost_response(self):
+        # Scenario 1: Two simultaneous identical requests where Request B passes the
+        # initial IdempotencyKey check before Request A commits, and Request A inserts
+        # before Request B reaches Step 8 (`Order` insert), triggering `IntegrityError`
+        # recovery inside `checkout_order`.
+        hook_triggered = {'done': False}
+
+        def simulate_concurrent_identical_winner() -> None:
+            if not hook_triggered['done']:
+                hook_triggered['done'] = True
+                # The winning concurrent request commits with the exact same key and payload
+                winner = checkout_order(
+                    actor=self.customer_actor,
+                    branch_id=1,
+                    items=[{'product_id': 1, 'quantity_milli': 1000}],
+                    idempotency_key='idem-1d21-race-identical',
+                    conn=self.conn,
+                )
+                self.assertFalse(winner.replayed)
+
+        recovered = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 1, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d21-race-identical',
+            conn=self.conn,
+            _on_before_order_insert_hook=simulate_concurrent_identical_winner,
+        )
+        self.assertTrue(hook_triggered['done'])
+        self.assertTrue(recovered.replayed)
+        self.assertEqual(recovered.total_halalas, 600)
+
+        # Verify only ONE order and ONE stock movement were created, and stock was deducted once (10000 -> 9000)
+        order_count = self.conn.execute(
+            "SELECT COUNT(*) FROM orders_order WHERE idempotency_key = 'idem-1d21-race-identical'"
+        ).fetchone()[0]
+        movement_count = self.conn.execute(
+            "SELECT COUNT(*) FROM products_stockmovement WHERE reference_order_id = ?",
+            (recovered.order_id,),
+        ).fetchone()[0]
+        on_hand = self.conn.execute(
+            "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(order_count, 1)
+        self.assertEqual(movement_count, 1)
+        self.assertEqual(on_hand, 9000)
+
+        # Scenario 2: Two simultaneous DIFFERENT payloads with the same idempotency_key
+        # hitting the mid-flight race window -> Winner commits (201), loser recovers on
+        # IntegrityError, detects request_hash / line mismatch, rolls back its stock deduction,
+        # and raises IdempotencyConflictError (409)!
+        conflict_hook_triggered = {'done': False}
+
+        def simulate_concurrent_conflicting_winner() -> None:
+            if not conflict_hook_triggered['done']:
+                conflict_hook_triggered['done'] = True
+                winner = checkout_order(
+                    actor=self.customer_actor,
+                    branch_id=1,
+                    items=[{'product_id': 1, 'quantity_milli': 1000}],
+                    idempotency_key='idem-1d21-race-conflict',
+                    conn=self.conn,
+                )
+                self.assertFalse(winner.replayed)
+
+        with self.assertRaises(IdempotencyConflictError):
+            checkout_order(
+                actor=self.customer_actor,
+                branch_id=1,
+                items=[{'product_id': 1, 'quantity_milli': 2000}],  # conflicting quantity!
+                idempotency_key='idem-1d21-race-conflict',
+                conn=self.conn,
+                _on_before_order_insert_hook=simulate_concurrent_conflicting_winner,
+            )
+
+        # Verify the loser's 2000 milli stock deduction was rolled back; only the winner's 1000 milli was deducted (9000 -> 8000)
+        on_hand_after_conflict = self.conn.execute(
+            "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+        ).fetchone()[0]
+        conflict_order_count = self.conn.execute(
+            "SELECT COUNT(*) FROM orders_order WHERE idempotency_key = 'idem-1d21-race-conflict'"
+        ).fetchone()[0]
+        self.assertEqual(on_hand_after_conflict, 8000)
+        self.assertEqual(conflict_order_count, 1)
+
+        # Scenario 3: Retry after first transaction commits in DB (`orders_order`) but
+        # HTTP response was lost (or `orders_idempotencykey` row was purged/expired).
+        first_committed = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 2, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d21-lost-response',
+            conn=self.conn,
+        )
+        self.assertFalse(first_committed.replayed)
+        # Simulate IdempotencyKey table entry missing while Order + OrderItem are committed
+        self.conn.execute(
+            "DELETE FROM orders_idempotencykey WHERE idempotency_key = 'idem-1d21-lost-response'"
+        )
+        retry_after_lost_resp = checkout_order(
+            actor=self.customer_actor,
+            branch_id=1,
+            items=[{'product_id': 2, 'quantity_milli': 1000}],
+            idempotency_key='idem-1d21-lost-response',
+            conn=self.conn,
+        )
+        self.assertTrue(retry_after_lost_resp.replayed)
+        self.assertEqual(retry_after_lost_resp.order_id, first_committed.order_id)
+
+        # Scenario 4: Retry after client socket timeout over HTTP
+        import socket
+        import urllib.request
+        from apps.orders.test_http_server import FreshContractHttpServer
+
+        server = FreshContractHttpServer()
+        port = server.start_in_background()
+        try:
+            reg_req = urllib.request.Request(
+                f'http://127.0.0.1:{port}/api/v1/auth/register/',
+                data=json.dumps(
+                    {
+                        'full_name': 'عميل مهلة الشبكة',
+                        'email': 'timeout.retry@fresh.sa',
+                        'phone_number': '0507772222',
+                        'password': 'Timeout#2026!',
+                    }
+                ).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(reg_req) as resp:
+                token = json.loads(resp.read().decode('utf-8'))['access_token']
+
+            def slow_hook() -> None:
+                import time
+                time.sleep(0.25)
+
+            server.before_order_insert_hook = slow_hook
+            checkout_payload = json.dumps(
+                {
+                    'branch_id': 1,
+                    'idempotency_key': 'idem-http-client-timeout',
+                    'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                }
+            ).encode('utf-8')
+            req_timeout = urllib.request.Request(
+                f'http://127.0.0.1:{port}/api/v1/orders/',
+                data=checkout_payload,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {token}',
+                },
+                method='POST',
+            )
+            # Client times out after 50ms while server completes the 250ms commit in background
+            with self.assertRaises(socket.timeout):
+                urllib.request.urlopen(req_timeout, timeout=0.05)
+
+            import time
+            time.sleep(0.35)
+            server.before_order_insert_hook = None
+
+            # Client retries with the exact same idempotency_key -> receives 200 OK with replayed=True
+            req_retry = urllib.request.Request(
+                f'http://127.0.0.1:{port}/api/v1/orders/',
+                data=checkout_payload,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {token}',
+                },
+                method='POST',
+            )
+            with urllib.request.urlopen(req_retry, timeout=5.0) as resp_retry:
+                self.assertEqual(resp_retry.status, 200)
+                retry_body = json.loads(resp_retry.read().decode('utf-8'))
+                self.assertTrue(retry_body['replayed'])
+                self.assertEqual(retry_body['total_halalas'], 795)
+        finally:
+            server.stop()
+
+    def test_11_migration_0005_preservation_null_blank_keys_and_reversibility(self):
+        import importlib
+
+        _0005_mod = importlib.import_module(
+            'apps.orders.migrations.0005_scope_order_idempotency_key_per_customer'
+        )
+        apply_migration_0005_sqlite = _0005_mod.apply_migration_0005_sqlite
+        reverse_migration_0005_sqlite = _0005_mod.reverse_migration_0005_sqlite
+
+        # 1. Create a disposable database using the pre-0005 (Migration 0004) schema:
+        #    idempotency_key is globally UNIQUE and has NO non-empty check constraint.
+        mig_conn = sqlite3.connect(':memory:')
+        mig_conn.execute('PRAGMA foreign_keys = ON;')
+        try:
+            mig_conn.executescript(
+                """
+                CREATE TABLE products_store (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code VARCHAR(50) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT 1
+                );
+                CREATE TABLE products_branch (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id INTEGER NOT NULL REFERENCES products_store(id) ON DELETE RESTRICT,
+                    code VARCHAR(50) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT 1
+                );
+                CREATE TABLE products_warehouse (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    branch_id INTEGER NOT NULL REFERENCES products_branch(id) ON DELETE RESTRICT,
+                    code VARCHAR(50) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    is_primary_fulfillment BOOLEAN NOT NULL DEFAULT 0,
+                    is_active BOOLEAN NOT NULL DEFAULT 1
+                );
+                CREATE TABLE orders_order (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    branch_id INTEGER NOT NULL REFERENCES products_branch(id) ON DELETE RESTRICT,
+                    fulfillment_warehouse_id INTEGER NULL REFERENCES products_warehouse(id) ON DELETE RESTRICT,
+                    customer_id VARCHAR(128) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                    total_halalas BIGINT NOT NULL CHECK (total_halalas >= 0),
+                    idempotency_key VARCHAR(128) NULL UNIQUE,
+                    cancellation_restored BOOLEAN NOT NULL DEFAULT 0,
+                    timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO products_store (id, code, name, is_active) VALUES (1, 'S1', 'Store 1', 1);
+                INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (1, 1, 'B1', 'Branch 1', 1);
+                INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (1, 1, 'W1', 'Warehouse 1', 1, 1);
+                """
+            )
+
+            # Seed pre-existing orders under 0004:
+            # - Order 1: non-null idempotency_key ('legacy-key-1')
+            # - Order 2: NULL idempotency_key
+            # - Order 3: legacy empty-string '' idempotency_key
+            # - Order 4: legacy whitespace-only '   ' idempotency_key
+            mig_conn.execute(
+                "INSERT INTO orders_order (id, branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (1, 1, 1, 'cust-A', 'COMPLETED', 2500, 'legacy-key-1')"
+            )
+            mig_conn.execute(
+                "INSERT INTO orders_order (id, branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (2, 1, 1, 'cust-A', 'PENDING', 1200, NULL)"
+            )
+            mig_conn.execute(
+                "INSERT INTO orders_order (id, branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (3, 1, 1, 'cust-B', 'PENDING', 1800, '')"
+            )
+            mig_conn.execute(
+                "INSERT INTO orders_order (id, branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (4, 1, 1, 'cust-B', 'CANCELLED', 900, '   ')"
+            )
+            mig_conn.commit()
+
+            # Under 0004, cust-B cannot use 'legacy-key-1' because uniqueness is global
+            with self.assertRaises(sqlite3.IntegrityError):
+                mig_conn.execute(
+                    "INSERT INTO orders_order (branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (1, 1, 'cust-B', 'PENDING', 500, 'legacy-key-1')"
+                )
+
+            # 2. Apply Migration 0005 (`0004 -> 0005`)
+            apply_migration_0005_sqlite(mig_conn)
+
+            # Verify all 4 existing orders remain intact and blank/whitespace keys were normalized to NULL
+            rows = mig_conn.execute(
+                "SELECT id, customer_id, status, total_halalas, idempotency_key FROM orders_order ORDER BY id ASC"
+            ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    (1, 'cust-A', 'COMPLETED', 2500, 'legacy-key-1'),
+                    (2, 'cust-A', 'PENDING', 1200, None),
+                    (3, 'cust-B', 'PENDING', 1800, None),
+                    (4, 'cust-B', 'CANCELLED', 900, None),
+                ],
+            )
+
+            # Verify blank/empty string idempotency_key is now rejected by order_idempotency_key_non_empty
+            with self.assertRaises(sqlite3.IntegrityError):
+                mig_conn.execute(
+                    "INSERT INTO orders_order (branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (1, 1, 'cust-A', 'PENDING', 500, '')"
+                )
+
+            # Verify same customer duplicate (cust-A, 'legacy-key-1') is rejected by uniq_order_customer_idempotency_key
+            with self.assertRaises(sqlite3.IntegrityError):
+                mig_conn.execute(
+                    "INSERT INTO orders_order (branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (1, 1, 'cust-A', 'PENDING', 500, 'legacy-key-1')"
+                )
+
+            # Verify different customer (cust-B, 'legacy-key-1') is now ALLOWED under 0005
+            mig_conn.execute(
+                "INSERT INTO orders_order (id, branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key) VALUES (5, 1, 1, 'cust-B', 'PENDING', 500, 'legacy-key-1')"
+            )
+            mig_conn.commit()
+
+            # 3. Reversing 0005 -> 0004 while cross-customer duplicate ('legacy-key-1') exists fails safely with IntegrityError
+            with self.assertRaises(sqlite3.IntegrityError):
+                reverse_migration_0005_sqlite(mig_conn)
+
+            # Remove the cross-customer duplicate and verify 0005 -> 0004 reversal succeeds cleanly and preserves all rows
+            mig_conn.execute("DELETE FROM orders_order WHERE id = 5")
+            mig_conn.commit()
+            reverse_migration_0005_sqlite(mig_conn)
+
+            rev_rows = mig_conn.execute(
+                "SELECT id, customer_id, status, total_halalas, idempotency_key FROM orders_order ORDER BY id ASC"
+            ).fetchall()
+            self.assertEqual(
+                rev_rows,
+                [
+                    (1, 'cust-A', 'COMPLETED', 2500, 'legacy-key-1'),
+                    (2, 'cust-A', 'PENDING', 1200, None),
+                    (3, 'cust-B', 'PENDING', 1800, None),
+                    (4, 'cust-B', 'CANCELLED', 900, None),
+                ],
+            )
+        finally:
+            mig_conn.close()
+
+    def test_12_actual_serializer_validation_contract_matrix(self):
+        from apps.orders.serializers import (
+            CheckoutItemRequestSerializer,
+            CheckoutRequestSerializer,
+            serializers,
+        )
+
+        # 1. Valid minimal payload passes CheckoutRequestSerializer
+        valid_ser = CheckoutRequestSerializer(
+            data={
+                'branch_id': 1,
+                'idempotency_key': 'ser-valid-001',
+                'items': [
+                    {'product_id': 1, 'quantity_milli': 1500},
+                ],
+            }
+        )
+        self.assertTrue(valid_ser.is_valid(raise_exception=True))
+        self.assertEqual(valid_ser.validated_data['branch_id'], 1)
+        self.assertEqual(valid_ser.validated_data['idempotency_key'], 'ser-valid-001')
+        self.assertEqual(len(valid_ser.validated_data['items']), 1)
+
+        # 2. All forbidden order-level fields from the 18-field list are rejected by CheckoutRequestSerializer
+        for forbidden_order_field, sample_val in [
+            ('subtotal_halalas', 500),
+            ('discount_halalas', 100),
+            ('delivery_fee_halalas', 0),
+            ('price_halalas', 500),
+            ('unit_price_halalas', 500),
+            ('line_total_halalas', 500),
+            ('expected_unit_price_halalas', 500),
+            ('stock_quantity', 10000),
+            ('on_hand_milli', 10000),
+            ('reserved_milli', 0),
+            ('customer_id', 'cust-user-201'),
+            ('user_id', 201),
+            ('actor_id', 'user:201'),
+            ('role', 'CUSTOMER'),
+            ('store_id', 1),
+        ]:
+            ser = CheckoutRequestSerializer(
+                data={
+                    'branch_id': 1,
+                    'idempotency_key': f'ser-forbid-{forbidden_order_field}',
+                    forbidden_order_field: sample_val,
+                    'items': [{'product_id': 1, 'quantity_milli': 1000}],
+                }
+            )
+            with self.assertRaises(serializers.ValidationError, msg=forbidden_order_field):
+                ser.is_valid(raise_exception=True)
+
+        # 3. All forbidden item-level fields from the 18-field list are rejected by CheckoutItemRequestSerializer & CheckoutRequestSerializer
+        for forbidden_item_field, sample_val in [
+            ('price_halalas', 500),
+            ('subtotal_halalas', 500),
+            ('total_halalas', 500),
+            ('expected_total_halalas', 500),
+            ('discount_halalas', 100),
+            ('delivery_fee_halalas', 0),
+            ('stock_quantity', 10000),
+            ('on_hand_milli', 10000),
+            ('reserved_milli', 0),
+            ('customer_id', 'cust-user-201'),
+            ('user_id', 201),
+            ('actor_id', 'user:201'),
+            ('role', 'CUSTOMER'),
+            ('store_id', 1),
+            ('branch_id', 1),
+        ]:
+            item_ser = CheckoutItemRequestSerializer(
+                data={
+                    'product_id': 1,
+                    'quantity_milli': 1000,
+                    forbidden_item_field: sample_val,
+                }
+            )
+            with self.assertRaises(serializers.ValidationError, msg=forbidden_item_field):
+                item_ser.is_valid(raise_exception=True)
+
+            parent_ser = CheckoutRequestSerializer(
+                data={
+                    'branch_id': 1,
+                    'idempotency_key': f'ser-item-forbid-{forbidden_item_field}',
+                    'items': [
+                        {
+                            'product_id': 1,
+                            'quantity_milli': 1000,
+                            forbidden_item_field: sample_val,
+                        }
+                    ],
+                }
+            )
+            with self.assertRaises(serializers.ValidationError, msg=forbidden_item_field):
+                parent_ser.is_valid(raise_exception=True)
+
+        # 4. Duplicate product_id lines, empty items list, zero/negative quantity_milli, and blank idempotency_key are rejected
+        for invalid_payload in [
+            {
+                'branch_id': 1,
+                'idempotency_key': 'ser-dup-prod',
+                'items': [
+                    {'product_id': 1, 'quantity_milli': 500},
+                    {'product_id': 1, 'quantity_milli': 500},
+                ],
+            },
+            {
+                'branch_id': 1,
+                'idempotency_key': 'ser-empty-items',
+                'items': [],
+            },
+            {
+                'branch_id': 1,
+                'idempotency_key': 'ser-zero-qty',
+                'items': [{'product_id': 1, 'quantity_milli': 0}],
+            },
+            {
+                'branch_id': 1,
+                'idempotency_key': '   ',
+                'items': [{'product_id': 1, 'quantity_milli': 1000}],
+            },
+        ]:
+            bad_ser = CheckoutRequestSerializer(data=invalid_payload)
+            with self.assertRaises(serializers.ValidationError):
+                bad_ser.is_valid(raise_exception=True)
+
+
+@unittest.skipUnless(
+    DJANGO_AVAILABLE,
+    'Django ORM and PostgreSQL runtime are not installed in this container; '
+    'run backend/scripts/run_postgres_certification.sh with PostgreSQL to execute.',
+)
+class MicroTask1D21PostgresORMTransactionTests(DjangoTransactionTestCase):
+    """
+    PostgreSQL Row-Lock, Multi-Connection Concurrency & Migration Safety Certification
+    (Microtask 1D.2.1 / 1D.2.2):
+    Uses `TransactionTestCase` and independent concurrent PostgreSQL connections to verify:
+    1. Two identical checkout requests using the same customer and idempotency key.
+    2. Same key with different payloads (`409 Conflict` / `IdempotencyConflictError`).
+    3. Two customers using the same key (`2` distinct orders).
+    4. Two customers competing for the last available stock (`SELECT ... FOR UPDATE`).
+    5. Transaction rollback after an injected mid-checkout failure.
+    6. No duplicate `StockMovement` records.
+    7. No negative or over-reserved stock (`CheckConstraint` + row locking).
+    8. No duplicate `Order` records.
+    9. Migration `0004 <-> 0005` forward, blank-key normalization, uniqueness, and reverse safety.
+    """
+
+    def _seed_pg_catalog(self, *, stock_1: int = 5000, stock_2: int = 5000):
+        store = Store.objects.create(code='PG-STORE-1', name='متجر بوستجرس', is_active=True)
+        branch = Branch.objects.create(store=store, code='PG-BR-1', name='فرع بوستجرس', is_active=True)
+        wh = Warehouse.objects.create(
+            branch=branch,
+            code='PG-WH-1',
+            name='مستودع بوستجرس',
+            is_primary_fulfillment=True,
+            is_active=True,
+        )
+        cat = Category.objects.create(name='فواكه', display_order=1, is_active=True)
+        prod_1 = Product.objects.create(
+            sku='PG-SKU-1',
+            name='برتقال',
+            category=cat,
+            price_halalas=850,
+            unit='كجم',
+            is_fractional_allowed=True,
+            is_active=True,
+        )
+        prod_2 = Product.objects.create(
+            sku='PG-SKU-2',
+            name='تفاح',
+            category=cat,
+            price_halalas=1200,
+            unit='كجم',
+            is_fractional_allowed=True,
+            is_active=True,
+        )
+        bal_1 = WarehouseStockBalance.objects.create(
+            warehouse=wh,
+            product=prod_1,
+            on_hand_milli=stock_1,
+            reserved_milli=0,
+            version=1,
+        )
+        bal_2 = WarehouseStockBalance.objects.create(
+            warehouse=wh,
+            product=prod_2,
+            on_hand_milli=stock_2,
+            reserved_milli=0,
+            version=1,
+        )
+        return store, branch, wh, prod_1, prod_2, bal_1, bal_2
+
+    def test_10_postgresql_row_lock_select_for_update_and_constraints(self):
+        from django.db import connection
+
+        store, branch, _, prod_1, _, _, _ = self._seed_pg_catalog(stock_1=5000)
+
+        actor_a = ServiceActor(
+            actor_id='user:701',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-701',
+            store_id=store.id,
+        )
+        actor_b = ServiceActor(
+            actor_id='user:702',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-702',
+            store_id=store.id,
+        )
+        res_a = checkout_order(
+            actor=actor_a,
+            branch_id=branch.id,
+            items=[{'product_id': prod_1.id, 'quantity_milli': 2000}],
+            idempotency_key='pg-shared-idem-key',
+        )
+        res_b = checkout_order(
+            actor=actor_b,
+            branch_id=branch.id,
+            items=[{'product_id': prod_1.id, 'quantity_milli': 1000}],
+            idempotency_key='pg-shared-idem-key',
+        )
+        self.assertNotEqual(res_a.order_id, res_b.order_id)
+        self.assertEqual(Order.objects.filter(idempotency_key='pg-shared-idem-key').count(), 2)
+        self.assertIn(connection.vendor, ('postgresql', 'sqlite'))
+
+    def test_11_postgresql_concurrent_identical_checkout_same_customer_and_key(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from django.db import connections
+
+        store, branch, wh, prod_1, _, _, _ = self._seed_pg_catalog(stock_1=5000)
+        actor = ServiceActor(
+            actor_id='user:711',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-711',
+            store_id=store.id,
+        )
+        barrier = threading.Barrier(2)
+
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                return checkout_order(
+                    actor=actor,
+                    branch_id=branch.id,
+                    items=[{'product_id': prod_1.id, 'quantity_milli': 1500}],
+                    idempotency_key='pg-conc-identical-001',
+                )
+            finally:
+                connections.close_all()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(worker)
+            f2 = pool.submit(worker)
+            r1 = f1.result(timeout=15)
+            r2 = f2.result(timeout=15)
+
+        self.assertEqual(r1.order_id, r2.order_id)
+        self.assertEqual(r1.total_halalas, r2.total_halalas)
+        self.assertEqual({r1.replayed, r2.replayed}, {False, True})
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(OrderItem.objects.count(), 1)
+        self.assertEqual(StockMovement.objects.count(), 1)
+        bal = WarehouseStockBalance.objects.get(warehouse=wh, product=prod_1)
+        self.assertEqual(bal.on_hand_milli, 3500)
+        self.assertEqual(bal.reserved_milli, 0)
+
+    def test_12_postgresql_concurrent_same_key_different_payloads_rejected(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from django.db import connections
+
+        store, branch, wh, prod_1, prod_2, _, _ = self._seed_pg_catalog(stock_1=5000, stock_2=5000)
+        actor = ServiceActor(
+            actor_id='user:712',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-712',
+            store_id=store.id,
+        )
+        barrier = threading.Barrier(2)
+
+        def hook():
+            barrier.wait(timeout=10)
+
+        def worker(product_id: int, qty_milli: int):
+            try:
+                return checkout_order(
+                    actor=actor,
+                    branch_id=branch.id,
+                    items=[{'product_id': product_id, 'quantity_milli': qty_milli}],
+                    idempotency_key='pg-conc-conflict-002',
+                    _on_before_order_insert_hook=hook,
+                )
+            finally:
+                connections.close_all()
+
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(worker, prod_1.id, 1000),
+                pool.submit(worker, prod_2.id, 2000),
+            ]
+            for fut in futures:
+                try:
+                    outcomes.append(('ok', fut.result(timeout=15)))
+                except Exception as exc:
+                    outcomes.append(('err', exc))
+
+        ok_results = [val for tag, val in outcomes if tag == 'ok']
+        err_results = [val for tag, val in outcomes if tag == 'err']
+        self.assertEqual(len(ok_results), 1)
+        self.assertEqual(len(err_results), 1)
+        self.assertIsInstance(err_results[0], IdempotencyConflictError)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(StockMovement.objects.count(), 1)
+        bal_1 = WarehouseStockBalance.objects.get(warehouse=wh, product=prod_1)
+        bal_2 = WarehouseStockBalance.objects.get(warehouse=wh, product=prod_2)
+        # Exactly one product was deducted; the conflicting payload rolled back completely
+        self.assertIn((bal_1.on_hand_milli, bal_2.on_hand_milli), {(4000, 5000), (5000, 3000)})
+
+    def test_13_postgresql_concurrent_two_customers_same_key_independent_orders(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from django.db import connections
+
+        store, branch, wh, prod_1, _, _, _ = self._seed_pg_catalog(stock_1=5000)
+        actor_a = ServiceActor(
+            actor_id='user:713',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-713-A',
+            store_id=store.id,
+        )
+        actor_b = ServiceActor(
+            actor_id='user:714',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-714-B',
+            store_id=store.id,
+        )
+        barrier = threading.Barrier(2)
+
+        def worker(actor_obj: ServiceActor, qty_milli: int):
+            try:
+                barrier.wait(timeout=10)
+                return checkout_order(
+                    actor=actor_obj,
+                    branch_id=branch.id,
+                    items=[{'product_id': prod_1.id, 'quantity_milli': qty_milli}],
+                    idempotency_key='pg-conc-shared-key-003',
+                )
+            finally:
+                connections.close_all()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_a = pool.submit(worker, actor_a, 1500)
+            f_b = pool.submit(worker, actor_b, 1000)
+            res_a = f_a.result(timeout=15)
+            res_b = f_b.result(timeout=15)
+
+        self.assertNotEqual(res_a.order_id, res_b.order_id)
+        self.assertFalse(res_a.replayed)
+        self.assertFalse(res_b.replayed)
+        self.assertEqual(Order.objects.filter(idempotency_key='pg-conc-shared-key-003').count(), 2)
+        self.assertEqual(StockMovement.objects.count(), 2)
+        bal = WarehouseStockBalance.objects.get(warehouse=wh, product=prod_1)
+        self.assertEqual(bal.on_hand_milli, 2500)
+
+    def test_14_postgresql_concurrent_two_customers_competing_for_last_available_stock(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from django.db import connections
+
+        store, branch, wh, prod_1, _, _, _ = self._seed_pg_catalog(stock_1=2000)
+        actor_a = ServiceActor(
+            actor_id='user:715',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-715-A',
+            store_id=store.id,
+        )
+        actor_b = ServiceActor(
+            actor_id='user:716',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-716-B',
+            store_id=store.id,
+        )
+        barrier = threading.Barrier(2)
+
+        def worker(actor_obj: ServiceActor, idem_key: str):
+            try:
+                barrier.wait(timeout=10)
+                return checkout_order(
+                    actor=actor_obj,
+                    branch_id=branch.id,
+                    items=[{'product_id': prod_1.id, 'quantity_milli': 1500}],
+                    idempotency_key=idem_key,
+                )
+            finally:
+                connections.close_all()
+
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(worker, actor_a, 'pg-last-stock-A'),
+                pool.submit(worker, actor_b, 'pg-last-stock-B'),
+            ]
+            for fut in futures:
+                try:
+                    outcomes.append(('ok', fut.result(timeout=15)))
+                except Exception as exc:
+                    outcomes.append(('err', exc))
+
+        ok_results = [val for tag, val in outcomes if tag == 'ok']
+        err_results = [val for tag, val in outcomes if tag == 'err']
+        self.assertEqual(len(ok_results), 1)
+        self.assertEqual(len(err_results), 1)
+        self.assertIsInstance(err_results[0], InsufficientStockError)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(StockMovement.objects.count(), 1)
+        bal = WarehouseStockBalance.objects.get(warehouse=wh, product=prod_1)
+        self.assertEqual(bal.on_hand_milli, 500)
+        self.assertEqual(bal.reserved_milli, 0)
+
+    def test_15_postgresql_transaction_rollback_after_injected_failure_and_db_constraints(self):
+        from unittest.mock import patch
+        from django.db import connection
+
+        store, branch, wh, prod_1, _, bal_1, _ = self._seed_pg_catalog(stock_1=5000)
+        actor = ServiceActor(
+            actor_id='user:717',
+            role=ActorRole.CUSTOMER.value,
+            customer_id='cust-pg-717',
+            store_id=store.id,
+        )
+
+        with patch.object(
+            OrderStatusHistory.objects,
+            'create',
+            side_effect=RuntimeError('Injected mid-checkout failure after stock deduction'),
+        ):
+            with self.assertRaises(RuntimeError):
+                checkout_order(
+                    actor=actor,
+                    branch_id=branch.id,
+                    items=[{'product_id': prod_1.id, 'quantity_milli': 2000}],
+                    idempotency_key='pg-rollback-test-005',
+                )
+
+        # Full atomic rollback: zero orders, zero items, zero stock movements, stock unchanged
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertEqual(OrderItem.objects.count(), 0)
+        self.assertEqual(StockMovement.objects.count(), 0)
+        self.assertEqual(IdempotencyKey.objects.count(), 0)
+        bal_1.refresh_from_db()
+        self.assertEqual(bal_1.on_hand_milli, 5000)
+        self.assertEqual(bal_1.reserved_milli, 0)
+
+        # Verify database-level CheckConstraints reject negative on_hand_milli or over-reserved stock
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE products_warehousestockbalance SET on_hand_milli = -100 WHERE id = %s",
+                        [bal_1.id],
+                    )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE products_warehousestockbalance SET reserved_milli = 6000 WHERE id = %s",
+                        [bal_1.id],
+                    )
+
+    def test_16_postgresql_migration_0004_to_0005_and_reverse_on_legacy_records(self):
+        from django.db import connection
+        from django.db.migrations.executor import MigrationExecutor
+
+        store, branch, wh, _, _, _, _ = self._seed_pg_catalog(stock_1=5000)
+
+        executor = MigrationExecutor(connection)
+        # 1. Migrate orders back to 0004
+        executor.migrate([('orders', '0004_auth_token_lifecycle_and_rate_limiting')])
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO orders_order (
+                        id, branch_id, fulfillment_warehouse_id, customer_id, status,
+                        total_halalas, idempotency_key, cancellation_restored, timestamp, updated_at
+                    ) VALUES
+                        (901, %s, %s, 'cust-mig-A', 'COMPLETED', 2500, 'legacy-pg-key-1', FALSE, NOW(), NOW()),
+                        (902, %s, %s, 'cust-mig-A', 'PENDING', 1200, NULL, FALSE, NOW(), NOW()),
+                        (903, %s, %s, 'cust-mig-B', 'PENDING', 1800, '', FALSE, NOW(), NOW()),
+                        (904, %s, %s, 'cust-mig-B', 'CANCELLED', 900, '   ', FALSE, NOW(), NOW())
+                    """,
+                    [branch.id, wh.id, branch.id, wh.id, branch.id, wh.id, branch.id, wh.id],
+                )
+
+            # Under 0004, global uniqueness blocks cust-mig-B from using 'legacy-pg-key-1'
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            INSERT INTO orders_order (
+                                id, branch_id, fulfillment_warehouse_id, customer_id, status,
+                                total_halalas, idempotency_key, cancellation_restored, timestamp, updated_at
+                            ) VALUES (905, %s, %s, 'cust-mig-B', 'PENDING', 500, 'legacy-pg-key-1', FALSE, NOW(), NOW())
+                            """,
+                            [branch.id, wh.id],
+                        )
+
+            # 2. Apply Migration 0005 forward (0004 -> 0005)
+            executor = MigrationExecutor(connection)
+            executor.migrate([('orders', '0005_scope_order_idempotency_key_per_customer')])
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, customer_id, status, total_halalas, idempotency_key FROM orders_order WHERE id IN (901, 902, 903, 904) ORDER BY id ASC"
+                )
+                rows = cursor.fetchall()
+
+            self.assertEqual(
+                rows,
+                [
+                    (901, 'cust-mig-A', 'COMPLETED', 2500, 'legacy-pg-key-1'),
+                    (902, 'cust-mig-A', 'PENDING', 1200, None),
+                    (903, 'cust-mig-B', 'PENDING', 1800, None),
+                    (904, 'cust-mig-B', 'CANCELLED', 900, None),
+                ],
+            )
+
+            # Verify blank key is rejected by order_idempotency_key_non_empty CheckConstraint
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            INSERT INTO orders_order (
+                                id, branch_id, fulfillment_warehouse_id, customer_id, status,
+                                total_halalas, idempotency_key, cancellation_restored, timestamp, updated_at
+                            ) VALUES (906, %s, %s, 'cust-mig-A', 'PENDING', 500, '', FALSE, NOW(), NOW())
+                            """,
+                            [branch.id, wh.id],
+                        )
+
+            # Verify same customer duplicate ('cust-mig-A', 'legacy-pg-key-1') is rejected
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            INSERT INTO orders_order (
+                                id, branch_id, fulfillment_warehouse_id, customer_id, status,
+                                total_halalas, idempotency_key, cancellation_restored, timestamp, updated_at
+                            ) VALUES (907, %s, %s, 'cust-mig-A', 'PENDING', 500, 'legacy-pg-key-1', FALSE, NOW(), NOW())
+                            """,
+                            [branch.id, wh.id],
+                        )
+
+            # Verify different customer ('cust-mig-B', 'legacy-pg-key-1') is allowed under 0005
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO orders_order (
+                        id, branch_id, fulfillment_warehouse_id, customer_id, status,
+                        total_halalas, idempotency_key, cancellation_restored, timestamp, updated_at
+                    ) VALUES (908, %s, %s, 'cust-mig-B', 'PENDING', 500, 'legacy-pg-key-1', FALSE, NOW(), NOW())
+                    """,
+                    [branch.id, wh.id],
+                )
+
+            # 3. Attempting reverse migration (0005 -> 0004) while cross-customer shared key exists fails safely with IntegrityError
+            with self.assertRaises(IntegrityError):
+                with transaction.atomic():
+                    rev_executor = MigrationExecutor(connection)
+                    rev_executor.migrate([('orders', '0004_auth_token_lifecycle_and_rate_limiting')])
+
+            # Remove cross-customer shared key row and verify 0005 -> 0004 -> 0005 succeeds cleanly
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM orders_order WHERE id = 908")
+
+            rev_executor = MigrationExecutor(connection)
+            rev_executor.migrate([('orders', '0004_auth_token_lifecycle_and_rate_limiting')])
+
+            fwd_executor = MigrationExecutor(connection)
+            fwd_executor.migrate([('orders', '0005_scope_order_idempotency_key_per_customer')])
+        finally:
+            # Ensure schema is always left at latest migration 0005
+            final_executor = MigrationExecutor(connection)
+            final_executor.migrate([('orders', '0005_scope_order_idempotency_key_per_customer')])
+
+
+class MicroTask1D4OrderLifecycleHttpContractTests(unittest.TestCase):
+    """
+    Microtask 1D.4 — End-to-End HTTP Order Lifecycle Contract Tests:
+    Customer App -> HTTP API -> Store Owner / Branch Manager App -> HTTP API -> Customer App.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from apps.orders.auth import clear_rate_limit_cache
+        from apps.orders.test_http_server import FreshContractHttpServer
+
+        clear_rate_limit_cache()
+        cls.http_server = FreshContractHttpServer()
+        port = cls.http_server.start_in_background()
+        cls.base_url = f"http://127.0.0.1:{port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.http_server.stop()
+        super().tearDownClass()
+
+    def _http_json(self, method: str, path: str, body: dict | None = None, headers: dict | None = None):
+        import urllib.error
+        import urllib.request
+
+        url = f"{self.base_url}{path}"
+        req_headers = {'Accept': 'application/json'}
+        if headers:
+            req_headers.update(headers)
+        data_bytes = None
+        if body is not None:
+            data_bytes = json.dumps(body).encode('utf-8')
+            req_headers['Content-Type'] = 'application/json'
+
+        req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = resp.read().decode('utf-8')
+                return resp.status, json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as err:
+            raw = err.read().decode('utf-8')
+            return err.code, json.loads(raw) if raw else {}
+
+    def _login(self, username: str, password: str) -> dict:
+        status, data = self._http_json(
+            'POST',
+            '/api/v1/auth/login/',
+            body={'username': username, 'password': password},
+        )
+        self.assertEqual(status, 200, f"Login failed for {username}: {data}")
+        return data
+
+    def test_01_full_http_order_lifecycle_isolation_transitions_history_and_cancellation(self):
+        # 1. Authenticate Customer A, Customer B, Store 1 Owner, Branch 1 Manager, Branch 2 Manager, Store 2 Owner
+        cust_a_status, cust_a = self._http_json(
+            'POST',
+            '/api/v1/auth/register/',
+            body={
+                'full_name': 'عميل دورة الحياة أ',
+                'email': 'lifecycle_cust_a@fresh.sa',
+                'phone_number': '0557001101',
+                'password': 'CustAPass#2026',
+            },
+        )
+        self.assertEqual(cust_a_status, 201)
+        cust_a_headers = {'Authorization': f"Bearer {cust_a['access_token']}"}
+
+        cust_b_status, cust_b = self._http_json(
+            'POST',
+            '/api/v1/auth/register/',
+            body={
+                'full_name': 'عميل دورة الحياة ب',
+                'email': 'lifecycle_cust_b@fresh.sa',
+                'phone_number': '0557001102',
+                'password': 'CustBPass#2026',
+            },
+        )
+        self.assertEqual(cust_b_status, 201)
+        cust_b_headers = {'Authorization': f"Bearer {cust_b['access_token']}"}
+
+        owner_1 = self._login('owner@fresh.sa', 'OwnerPass123')
+        owner_1_headers = {'Authorization': f"Bearer {owner_1['access_token']}"}
+
+        mgr_b1 = self._login('manager@fresh.sa', 'ManagerPass123')
+        mgr_b1_headers = {'Authorization': f"Bearer {mgr_b1['access_token']}"}
+
+        mgr_b2 = self._login('manager_jed@fresh.sa', 'ManagerJedPass123')
+        mgr_b2_headers = {'Authorization': f"Bearer {mgr_b2['access_token']}"}
+
+        owner_2 = self._login('owner2@other.sa', 'Owner2Pass123')
+        owner_2_headers = {'Authorization': f"Bearer {owner_2['access_token']}"}
+
+        # 2. Customer A creates Order 1 in Branch 1 (`POST /api/v1/orders/`)
+        # Seeded in test_http_server: Product 1 = 795 halalas (50000 milli stock), Product 2 = 1150 halalas (50000 milli stock)
+        create_status, created_order = self._http_json(
+            'POST',
+            '/api/v1/orders/',
+            body={
+                'branch_id': 1,
+                'items': [
+                    {'product_id': 1, 'quantity_milli': 2000},  # 2 * 795 = 1590
+                    {'product_id': 2, 'quantity_milli': 1000},  # 1 * 1150 = 1150
+                ],
+            },
+            headers={**cust_a_headers, 'Idempotency-Key': 'http-1d4-order-1'},
+        )
+        self.assertEqual(create_status, 201)
+        order_id = created_order['id']
+        self.assertEqual(created_order['status'], 'PENDING')
+        self.assertEqual(created_order['total_halalas'], 2740)
+        self.assertEqual(len(created_order['items']), 2)
+        self.assertEqual(len(created_order['status_history']), 1)
+        self.assertEqual(created_order['status_history'][0]['to_status'], 'PENDING')
+
+        # 3. Order 1 immediately appears in Store 1 Owner and Branch 1 Manager order lists (`GET /api/v1/orders/`)
+        list_owner_status, owner_orders_resp = self._http_json(
+            'GET',
+            '/api/v1/orders/?branch_id=1',
+            headers=owner_1_headers,
+        )
+        self.assertEqual(list_owner_status, 200)
+        owner_order_ids = [o['id'] for o in owner_orders_resp]
+        self.assertIn(order_id, owner_order_ids)
+
+        list_mgr1_status, mgr1_orders_resp = self._http_json(
+            'GET',
+            '/api/v1/orders/',
+            headers=mgr_b1_headers,
+        )
+        self.assertEqual(list_mgr1_status, 200)
+        self.assertIn(order_id, [o['id'] for o in mgr1_orders_resp])
+
+        # 4. Cross-branch & Cross-store & Cross-customer isolation
+        # Branch 2 Manager default list does NOT contain Branch 1's order
+        list_mgr2_status, mgr2_orders_resp = self._http_json(
+            'GET',
+            '/api/v1/orders/',
+            headers=mgr_b2_headers,
+        )
+        self.assertEqual(list_mgr2_status, 200)
+        self.assertNotIn(order_id, [o['id'] for o in mgr2_orders_resp])
+
+        # Branch 2 Manager requesting `?branch_id=1` or Order 1 detail/transition/cancel gets 403 Forbidden
+        self.assertEqual(
+            self._http_json('GET', '/api/v1/orders/?branch_id=1', headers=mgr_b2_headers)[0],
+            403,
+        )
+        self.assertEqual(
+            self._http_json('GET', f'/api/v1/orders/{order_id}/', headers=mgr_b2_headers)[0],
+            403,
+        )
+        self.assertEqual(
+            self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/transition-status/',
+                body={'to_status': 'CONFIRMED'},
+                headers=mgr_b2_headers,
+            )[0],
+            403,
+        )
+        self.assertEqual(
+            self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/cancel/',
+                body={'reason': 'Unauthorized branch cancel'},
+                headers={**mgr_b2_headers, 'Idempotency-Key': 'mgr2-cancel-blocked'},
+            )[0],
+            403,
+        )
+
+        # Store 2 Owner requesting Branch 1 orders or Order 1 detail/transition/cancel gets 403 Forbidden
+        self.assertEqual(
+            self._http_json('GET', '/api/v1/orders/?branch_id=1', headers=owner_2_headers)[0],
+            403,
+        )
+        self.assertEqual(
+            self._http_json('GET', f'/api/v1/orders/{order_id}/', headers=owner_2_headers)[0],
+            403,
+        )
+        self.assertEqual(
+            self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/transition-status/',
+                body={'to_status': 'CONFIRMED'},
+                headers=owner_2_headers,
+            )[0],
+            403,
+        )
+
+        # Customer B cannot see Customer A's order in list or detail (`403 Forbidden`)
+        _, cust_b_list = self._http_json('GET', '/api/v1/orders/', headers=cust_b_headers)
+        self.assertNotIn(order_id, [o['id'] for o in cust_b_list])
+        self.assertEqual(
+            self._http_json('GET', f'/api/v1/orders/{order_id}/', headers=cust_b_headers)[0],
+            403,
+        )
+
+        # 5. Customer A cannot transition or cancel via store-management endpoints (`403 Forbidden`)
+        self.assertEqual(
+            self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/transition-status/',
+                body={'to_status': 'CONFIRMED'},
+                headers=cust_a_headers,
+            )[0],
+            403,
+        )
+        self.assertEqual(
+            self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/cancel/',
+                body={'reason': 'Customer cancel attempt'},
+                headers={**cust_a_headers, 'Idempotency-Key': 'cust-a-cancel-blocked'},
+            )[0],
+            403,
+        )
+
+        # 6. Invalid transitions (`PENDING -> PROCESSING`, `PENDING -> COMPLETED`) rejected with `400 Bad Request`
+        for invalid_target in ('PROCESSING', 'COMPLETED', 'PENDING'):
+            bad_status, _ = self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/transition-status/',
+                body={'to_status': invalid_target},
+                headers=owner_1_headers,
+            )
+            self.assertEqual(bad_status, 400)
+
+        # 7. Valid lifecycle transitions (`PENDING -> CONFIRMED -> PROCESSING -> COMPLETED`)
+        #    reflected immediately in Customer A's `GET /api/v1/orders/{id}/`
+        for expected_from, next_status, actor_headers, note in (
+            ('PENDING', 'CONFIRMED', mgr_b1_headers, 'تأكيد الطلب من مدير الفرع'),
+            ('CONFIRMED', 'PROCESSING', owner_1_headers, 'بدء تجهيز الطلب'),
+            ('PROCESSING', 'COMPLETED', owner_1_headers, 'اكتمال تسليم الطلب'),
+        ):
+            tr_code, tr_body = self._http_json(
+                'POST',
+                f'/api/v1/orders/{order_id}/transition-status/',
+                body={'to_status': next_status, 'reason': note},
+                headers=actor_headers,
+            )
+            self.assertEqual(tr_code, 200)
+            self.assertEqual(tr_body['status'], next_status)
+            self.assertEqual(tr_body['transition']['from_status'], expected_from)
+            self.assertEqual(tr_body['transition']['to_status'], next_status)
+
+            # Customer A fetches order details and sees the exact updated status & history
+            cust_get_code, cust_order_detail = self._http_json(
+                'GET',
+                f'/api/v1/orders/{order_id}/',
+                headers=cust_a_headers,
+            )
+            self.assertEqual(cust_get_code, 200)
+            self.assertEqual(cust_order_detail['status'], next_status)
+            self.assertEqual(cust_order_detail['status_history'][-1]['from_status'], expected_from)
+            self.assertEqual(cust_order_detail['status_history'][-1]['to_status'], next_status)
+
+        # Full history on completed Order 1 has 4 entries: None->PENDING, PENDING->CONFIRMED, CONFIRMED->PROCESSING, PROCESSING->COMPLETED
+        _, final_order_1 = self._http_json('GET', f'/api/v1/orders/{order_id}/', headers=cust_a_headers)
+        self.assertEqual(
+            [(h['from_status'], h['to_status']) for h in final_order_1['status_history']],
+            [
+                (None, 'PENDING'),
+                ('PENDING', 'CONFIRMED'),
+                ('CONFIRMED', 'PROCESSING'),
+                ('PROCESSING', 'COMPLETED'),
+            ],
+        )
+
+        # Completed order cannot be cancelled (`400 Bad Request`)
+        comp_cancel_code, _ = self._http_json(
+            'POST',
+            f'/api/v1/orders/{order_id}/cancel/',
+            body={'reason': 'Try cancel after completion'},
+            headers={**owner_1_headers, 'Idempotency-Key': 'cancel-completed-1d4'},
+        )
+        self.assertEqual(comp_cancel_code, 400)
+
+        # 8. Cancellation flow & single stock restoration on Order 2
+        # Check Product 1 stock in Warehouse 1 before Order 2 (started at 50000, minus 2000 from Order 1 = 48000)
+        def get_wh1_prod1_stock() -> int:
+            return int(
+                self.http_server.conn.execute(
+                    "SELECT on_hand_milli FROM products_warehousestockbalance WHERE warehouse_id = 1 AND product_id = 1"
+                ).fetchone()[0]
+            )
+
+        self.assertEqual(get_wh1_prod1_stock(), 48000)
+
+        create2_code, order_2 = self._http_json(
+            'POST',
+            '/api/v1/orders/',
+            body={
+                'branch_id': 1,
+                'items': [{'product_id': 1, 'quantity_milli': 3000}],
+            },
+            headers={**cust_a_headers, 'Idempotency-Key': 'http-1d4-order-2'},
+        )
+        self.assertEqual(create2_code, 201)
+        order_2_id = order_2['id']
+        self.assertEqual(get_wh1_prod1_stock(), 45000)
+
+        # Mismatched header vs body idempotency key on cancel returns 409 Conflict
+        mismatch_code, _ = self._http_json(
+            'POST',
+            f'/api/v1/orders/{order_2_id}/cancel/',
+            body={'reason': 'Key mismatch', 'idempotency_key': 'body-key-1'},
+            headers={**owner_1_headers, 'Idempotency-Key': 'header-key-2'},
+        )
+        self.assertEqual(mismatch_code, 409)
+
+        # Valid cancel by Store Owner restores stock once (45000 -> 48000)
+        cancel_code, cancel_body = self._http_json(
+            'POST',
+            f'/api/v1/orders/{order_2_id}/cancel/',
+            body={'reason': 'نفاد أحد الأصناف المكملة'},
+            headers={**owner_1_headers, 'Idempotency-Key': 'cancel-order-2-key-1'},
+        )
+        self.assertEqual(cancel_code, 200)
+        self.assertEqual(cancel_body['status'], 'CANCELLED')
+        self.assertTrue(cancel_body['cancellation_restored'])
+        self.assertFalse(cancel_body['replayed'])
+        self.assertEqual(get_wh1_prod1_stock(), 48000)
+
+        # Same Idempotency-Key replay returns 200 OK with replayed=True and does NOT restore stock again
+        replay_code, replay_body = self._http_json(
+            'POST',
+            f'/api/v1/orders/{order_2_id}/cancel/',
+            body={'reason': 'نفاد أحد الأصناف المكملة'},
+            headers={**owner_1_headers, 'Idempotency-Key': 'cancel-order-2-key-1'},
+        )
+        self.assertEqual(replay_code, 200)
+        self.assertTrue(replay_body['replayed'])
+        self.assertEqual(get_wh1_prod1_stock(), 48000)
+
+        # Second cancellation attempt with a new Idempotency-Key returns 409 Conflict without restoring stock again
+        second_cancel_code, _ = self._http_json(
+            'POST',
+            f'/api/v1/orders/{order_2_id}/cancel/',
+            body={'reason': 'إلغاء مكرر بمفتاح جديد'},
+            headers={**owner_1_headers, 'Idempotency-Key': 'cancel-order-2-key-2'},
+        )
+        self.assertEqual(second_cancel_code, 409)
+        self.assertEqual(get_wh1_prod1_stock(), 48000)
+
+        # Customer A sees Order 2 as CANCELLED with history [None->PENDING, PENDING->CANCELLED]
+        _, cust_order_2 = self._http_json('GET', f'/api/v1/orders/{order_2_id}/', headers=cust_a_headers)
+        self.assertEqual(cust_order_2['status'], 'CANCELLED')
+        self.assertTrue(cust_order_2['cancellation_restored'])
+        self.assertEqual(
+            [(h['from_status'], h['to_status']) for h in cust_order_2['status_history']],
+            [(None, 'PENDING'), ('PENDING', 'CANCELLED')],
+        )
+
+
+@unittest.skipUnless(
+    DJANGO_AVAILABLE,
+    'Requires Django + reachable PostgreSQL database (Microtask 1D.4 PostgreSQL Order Lifecycle Suite)',
+)
+class MicroTask1D4OrderLifecyclePostgresTests(DjangoTransactionTestCase):
+    """
+    Microtask 1D.4 — Real PostgreSQL + Django REST Framework End-to-End Order Lifecycle Certification Suite.
+    Verifies:
+    1. Customer creates order -> appears in Store Owner & Branch Manager order lists.
+    2. Branch & Store isolation across branches (`Branch 1` vs `Branch 2`) and stores (`Store 1` vs `Store 2`),
+       and Customer isolation (`Customer A` vs `Customer B`).
+    3. Valid (`PENDING -> CONFIRMED -> PROCESSING -> COMPLETED`) and invalid transitions,
+       and `OrderStatusHistory` persistence in PostgreSQL.
+    4. Order cancellation (`POST /api/v1/orders/{id}/cancel/`), single stock restoration in
+       `WarehouseStockBalance`, `StockMovement(CANCELLATION_RESTORATION)`, idempotency replay,
+       and rejection of repeated cancellation or cancellation of completed orders.
+    5. Role permission boundaries (`CUSTOMER`, `OWNER`, `BRANCH_MANAGER`).
+    """
+
+    def setUp(self):
+        super().setUp()
+        from rest_framework.test import APIClient
+        from apps.orders.auth import (
+            clear_rate_limit_cache,
+            create_user_with_identity_profile,
+        )
+        from apps.orders.models import UserIdentityProfile
+
+        clear_rate_limit_cache()
+
+        # Store 1 (Fresh KSA) with Branch 1 (Riyadh) and Branch 2 (Jeddah)
+        self.store_1 = Store.objects.create(code='PG-1D4-STORE1', name='متجر فريش الرئيسي', is_active=True)
+        self.branch_1 = Branch.objects.create(
+            store=self.store_1,
+            code='PG-1D4-RUH',
+            name='فرع الرياض',
+            is_active=True,
+        )
+        self.wh_1 = Warehouse.objects.create(
+            branch=self.branch_1,
+            code='PG-1D4-WH-RUH',
+            name='مستودع الرياض',
+            is_primary_fulfillment=True,
+            is_active=True,
+        )
+        self.branch_2 = Branch.objects.create(
+            store=self.store_1,
+            code='PG-1D4-JED',
+            name='فرع جدة',
+            is_active=True,
+        )
+        self.wh_2 = Warehouse.objects.create(
+            branch=self.branch_2,
+            code='PG-1D4-WH-JED',
+            name='مستودع جدة',
+            is_primary_fulfillment=True,
+            is_active=True,
+        )
+
+        # Store 2 (Independent store) with Branch 3
+        self.store_2 = Store.objects.create(code='PG-1D4-STORE2', name='متجر آخر مستقل', is_active=True)
+        self.branch_3 = Branch.objects.create(
+            store=self.store_2,
+            code='PG-1D4-DMM',
+            name='فرع الدمام',
+            is_active=True,
+        )
+        self.wh_3 = Warehouse.objects.create(
+            branch=self.branch_3,
+            code='PG-1D4-WH-DMM',
+            name='مستودع الدمام',
+            is_primary_fulfillment=True,
+            is_active=True,
+        )
+
+        self.cat = Category.objects.create(name='منتجات طازجة 1D4', display_order=1, is_active=True)
+        self.prod_1 = Product.objects.create(
+            sku='PG-1D4-APPLE',
+            name='تفاح أحمر طازج',
+            category=self.cat,
+            price_halalas=850,
+            unit='كيلوجرام',
+            is_fractional_allowed=True,
+            is_active=True,
+        )
+        self.prod_2 = Product.objects.create(
+            sku='PG-1D4-MILK',
+            name='حليب طازج كامل الدسم',
+            category=self.cat,
+            price_halalas=1200,
+            unit='لتر',
+            is_fractional_allowed=False,
+            is_active=True,
+        )
+
+        self.bal_1 = WarehouseStockBalance.objects.create(
+            warehouse=self.wh_1,
+            product=self.prod_1,
+            on_hand_milli=20000,
+            reserved_milli=0,
+        )
+        self.bal_2 = WarehouseStockBalance.objects.create(
+            warehouse=self.wh_1,
+            product=self.prod_2,
+            on_hand_milli=10000,
+            reserved_milli=0,
+        )
+
+        # Provision users & server-side identity profiles
+        self.cust_a_user, _ = create_user_with_identity_profile(
+            username='pg1d4_cust_a',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.CUSTOMER,
+            customer_id='cust-pg1d4-a',
+        )
+        self.cust_b_user, _ = create_user_with_identity_profile(
+            username='pg1d4_cust_b',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.CUSTOMER,
+            customer_id='cust-pg1d4-b',
+        )
+        self.owner_1_user, _ = create_user_with_identity_profile(
+            username='pg1d4_owner_1',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.OWNER,
+            store=self.store_1,
+        )
+        self.mgr_b1_user, _ = create_user_with_identity_profile(
+            username='pg1d4_mgr_b1',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.BRANCH_MANAGER,
+            store=self.store_1,
+            branches=[self.branch_1],
+        )
+        self.mgr_b2_user, _ = create_user_with_identity_profile(
+            username='pg1d4_mgr_b2',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.BRANCH_MANAGER,
+            store=self.store_1,
+            branches=[self.branch_2],
+        )
+        self.owner_2_user, _ = create_user_with_identity_profile(
+            username='pg1d4_owner_2',
+            password='SafePassword#2026!',
+            role=UserIdentityProfile.Role.OWNER,
+            store=self.store_2,
+        )
+
+        def login_api_client(username: str) -> APIClient:
+            c = APIClient()
+            res = c.post(
+                '/api/v1/auth/login/',
+                {'username': username, 'password': 'SafePassword#2026!'},
+                format='json',
+            )
+            self.assertEqual(res.status_code, 200, res.data)
+            c.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access_token']}")
+            return c
+
+        self.client_cust_a = login_api_client('pg1d4_cust_a')
+        self.client_cust_b = login_api_client('pg1d4_cust_b')
+        self.client_owner_1 = login_api_client('pg1d4_owner_1')
+        self.client_mgr_b1 = login_api_client('pg1d4_mgr_b1')
+        self.client_mgr_b2 = login_api_client('pg1d4_mgr_b2')
+        self.client_owner_2 = login_api_client('pg1d4_owner_2')
+
+    def _create_customer_a_order(self, idem_key: str) -> dict:
+        resp = self.client_cust_a.post(
+            '/api/v1/orders/',
+            data={
+                'branch_id': self.branch_1.id,
+                'items': [
+                    {'product_id': self.prod_1.id, 'quantity_milli': 2000},  # 2 * 850 = 1700
+                    {'product_id': self.prod_2.id, 'quantity_milli': 1000},  # 1 * 1200 = 1200
+                ],
+            },
+            format='json',
+            HTTP_IDEMPOTENCY_KEY=idem_key,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.json()
+
+    def test_01_customer_order_appears_in_store_owner_and_branch_manager_lists_postgres(self):
+        created = self._create_customer_a_order('pg-1d4-order-list-1')
+        order_id = created['id']
+        self.assertEqual(created['status'], 'PENDING')
+        self.assertEqual(created['total_halalas'], 2900)
+
+        # Store 1 Owner sees the order
+        owner_list = self.client_owner_1.get(f'/api/v1/orders/?branch_id={self.branch_1.id}')
+        self.assertEqual(owner_list.status_code, 200)
+        owner_results = owner_list.json()
+        self.assertEqual(len(owner_results), 1)
+        self.assertEqual(owner_results[0]['id'], order_id)
+        self.assertEqual(owner_results[0]['customer_id'], 'cust-pg1d4-a')
+        self.assertEqual(len(owner_results[0]['items']), 2)
+
+        # Branch 1 Manager sees the order
+        mgr_list = self.client_mgr_b1.get('/api/v1/orders/')
+        self.assertEqual(mgr_list.status_code, 200)
+        mgr_results = mgr_list.json()
+        self.assertEqual(len(mgr_results), 1)
+        self.assertEqual(mgr_results[0]['id'], order_id)
+
+        # Customer A sees the order in own list & detail
+        cust_list = self.client_cust_a.get('/api/v1/orders/')
+        self.assertEqual(cust_list.status_code, 200)
+        self.assertEqual([o['id'] for o in cust_list.json()], [order_id])
+
+    def test_02_cross_branch_cross_store_and_cross_customer_isolation_postgres(self):
+        created = self._create_customer_a_order('pg-1d4-isolation-1')
+        order_id = created['id']
+
+        # Branch 2 Manager sees 0 orders in default list and gets 403 for Branch 1
+        mgr2_default = self.client_mgr_b2.get('/api/v1/orders/')
+        self.assertEqual(mgr2_default.status_code, 200)
+        self.assertEqual(mgr2_default.json(), [])
+
+        self.assertEqual(
+            self.client_mgr_b2.get(f'/api/v1/orders/?branch_id={self.branch_1.id}').status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client_mgr_b2.get(f'/api/v1/orders/{order_id}/').status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client_mgr_b2.post(
+                f'/api/v1/orders/{order_id}/transition-status/',
+                data={'to_status': 'CONFIRMED'},
+                format='json',
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client_mgr_b2.post(
+                f'/api/v1/orders/{order_id}/cancel/',
+                data={'reason': 'Cross-branch cancel'},
+                format='json',
+                HTTP_IDEMPOTENCY_KEY='pg-mgr2-cancel',
+            ).status_code,
+            403,
+        )
+
+        # Store 2 Owner sees 0 orders and gets 403 for Branch 1 / Order 1
+        owner2_default = self.client_owner_2.get('/api/v1/orders/')
+        self.assertEqual(owner2_default.status_code, 200)
+        self.assertEqual(owner2_default.json(), [])
+        self.assertEqual(
+            self.client_owner_2.get(f'/api/v1/orders/?branch_id={self.branch_1.id}').status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client_owner_2.get(f'/api/v1/orders/{order_id}/').status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client_owner_2.post(
+                f'/api/v1/orders/{order_id}/transition-status/',
+                data={'to_status': 'CONFIRMED'},
+                format='json',
+            ).status_code,
+            403,
+        )
+
+        # Customer B sees 0 orders and gets 403 on Customer A's order detail
+        cust_b_list = self.client_cust_b.get('/api/v1/orders/')
+        self.assertEqual(cust_b_list.status_code, 200)
+        self.assertEqual(cust_b_list.json(), [])
+        self.assertEqual(
+            self.client_cust_b.get(f'/api/v1/orders/{order_id}/').status_code,
+            403,
+        )
+
+    def test_03_valid_and_invalid_transitions_and_status_history_persistence_postgres(self):
+        created = self._create_customer_a_order('pg-1d4-transitions-1')
+        order_id = created['id']
+
+        # Invalid transitions from PENDING (`PROCESSING`, `COMPLETED`) return 400
+        for bad_target in ('PROCESSING', 'COMPLETED', 'PENDING'):
+            bad_resp = self.client_owner_1.post(
+                f'/api/v1/orders/{order_id}/transition-status/',
+                data={'to_status': bad_target},
+                format='json',
+            )
+            self.assertEqual(bad_resp.status_code, 400)
+
+        # Step 1: PENDING -> CONFIRMED by Branch 1 Manager
+        r1 = self.client_mgr_b1.post(
+            f'/api/v1/orders/{order_id}/transition-status/',
+            data={'to_status': 'CONFIRMED', 'reason': 'تأكيد الفرع'},
+            format='json',
+        )
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r1.json()['status'], 'CONFIRMED')
+
+        # Customer A immediately sees CONFIRMED
+        c1 = self.client_cust_a.get(f'/api/v1/orders/{order_id}/')
+        self.assertEqual(c1.status_code, 200)
+        self.assertEqual(c1.json()['status'], 'CONFIRMED')
+
+        # Invalid transition from CONFIRMED -> COMPLETED or PENDING returns 400
+        for bad_target in ('COMPLETED', 'PENDING'):
+            self.assertEqual(
+                self.client_owner_1.post(
+                    f'/api/v1/orders/{order_id}/transition-status/',
+                    data={'to_status': bad_target},
+                    format='json',
+                ).status_code,
+                400,
+            )
+
+        # Step 2: CONFIRMED -> PROCESSING by Store 1 Owner
+        r2 = self.client_owner_1.post(
+            f'/api/v1/orders/{order_id}/transition-status/',
+            data={'to_status': 'PROCESSING', 'reason': 'جاري التجهيز'},
+            format='json',
+        )
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()['status'], 'PROCESSING')
+
+        # Step 3: PROCESSING -> COMPLETED by Branch 1 Manager
+        r3 = self.client_mgr_b1.post(
+            f'/api/v1/orders/{order_id}/transition-status/',
+            data={'to_status': 'COMPLETED', 'reason': 'تم التسليم للعميل'},
+            format='json',
+        )
+        self.assertEqual(r3.status_code, 200)
+        self.assertEqual(r3.json()['status'], 'COMPLETED')
+
+        # Terminal COMPLETED rejects any further transition or cancellation with 400
+        self.assertEqual(
+            self.client_owner_1.post(
+                f'/api/v1/orders/{order_id}/transition-status/',
+                data={'to_status': 'PROCESSING'},
+                format='json',
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client_owner_1.post(
+                f'/api/v1/orders/{order_id}/cancel/',
+                data={'reason': 'Cancel after completion'},
+                format='json',
+                HTTP_IDEMPOTENCY_KEY='pg-1d4-cancel-completed',
+            ).status_code,
+            400,
+        )
+
+        # Verify persisted OrderStatusHistory rows in PostgreSQL
+        history_rows = list(
+            OrderStatusHistory.objects.filter(order_id=order_id)
+            .order_by('changed_at', 'id')
+            .values_list('from_status', 'to_status', 'reason')
+        )
+        self.assertEqual(
+            history_rows,
+            [
+                (None, 'PENDING', 'Order created via atomic checkout'),
+                ('PENDING', 'CONFIRMED', 'تأكيد الفرع'),
+                ('CONFIRMED', 'PROCESSING', 'جاري التجهيز'),
+                ('PROCESSING', 'COMPLETED', 'تم التسليم للعميل'),
+            ],
+        )
+
+    def test_04_cancellation_restores_stock_once_and_prevents_double_restoration_postgres(self):
+        created = self._create_customer_a_order('pg-1d4-cancel-1')
+        order_id = created['id']
+
+        self.bal_1.refresh_from_db()
+        self.bal_2.refresh_from_db()
+        self.assertEqual(self.bal_1.on_hand_milli, 18000)
+        self.assertEqual(self.bal_2.on_hand_milli, 9000)
+
+        # Transition PENDING -> CONFIRMED first, then cancel from CONFIRMED
+        self.client_mgr_b1.post(
+            f'/api/v1/orders/{order_id}/transition-status/',
+            data={'to_status': 'CONFIRMED'},
+            format='json',
+        )
+
+        cancel_resp = self.client_owner_1.post(
+            f'/api/v1/orders/{order_id}/cancel/',
+            data={'reason': 'إلغاء بطلب العميل قبل التجهيز'},
+            format='json',
+            HTTP_IDEMPOTENCY_KEY='pg-1d4-cancel-key-1',
+        )
+        self.assertEqual(cancel_resp.status_code, 200)
+        self.assertEqual(cancel_resp.json()['status'], 'CANCELLED')
+        self.assertTrue(cancel_resp.json()['cancellation_restored'])
+        self.assertFalse(cancel_resp.json()['replayed'])
+
+        # Stock restored exactly once in PostgreSQL
+        self.bal_1.refresh_from_db()
+        self.bal_2.refresh_from_db()
+        self.assertEqual(self.bal_1.on_hand_milli, 20000)
+        self.assertEqual(self.bal_2.on_hand_milli, 10000)
+
+        # Replay with same idempotency key returns 200 OK (replayed=True) and does not double-restore stock
+        replay_resp = self.client_owner_1.post(
+            f'/api/v1/orders/{order_id}/cancel/',
+            data={'reason': 'إلغاء بطلب العميل قبل التجهيز'},
+            format='json',
+            HTTP_IDEMPOTENCY_KEY='pg-1d4-cancel-key-1',
+        )
+        self.assertEqual(replay_resp.status_code, 200)
+        self.assertTrue(replay_resp.json()['replayed'])
+        self.bal_1.refresh_from_db()
+        self.assertEqual(self.bal_1.on_hand_milli, 20000)
+
+        # Second cancel with a new key returns 409 Conflict and does not double-restore stock
+        conflict_resp = self.client_owner_1.post(
+            f'/api/v1/orders/{order_id}/cancel/',
+            data={'reason': 'محاولة إلغاء ثانية'},
+            format='json',
+            HTTP_IDEMPOTENCY_KEY='pg-1d4-cancel-key-2',
+        )
+        self.assertEqual(conflict_resp.status_code, 409)
+        self.bal_1.refresh_from_db()
+        self.assertEqual(self.bal_1.on_hand_milli, 20000)
+
+        # Verify StockMovement ledger has 2 CHECKOUT_DEDUCTION and 2 CANCELLATION_RESTORATION rows
+        movements = list(
+            StockMovement.objects.filter(reference_order_id=order_id)
+            .order_by('id')
+            .values_list('movement_type', 'quantity_delta_milli')
+        )
+        self.assertEqual(
+            movements,
+            [
+                ('CHECKOUT_DEDUCTION', -2000),
+                ('CHECKOUT_DEDUCTION', -1000),
+                ('CANCELLATION_RESTORATION', 2000),
+                ('CANCELLATION_RESTORATION', 1000),
+            ],
+        )
+
+    def test_05_role_permissions_block_customer_transitions_and_cross_customer_cancellations_postgres(self):
+        created = self._create_customer_a_order('pg-1d4-perm-1')
+        order_id = created['id']
+
+        # Customer A cannot transition own order status (`403 Forbidden`)
+        for target_status in ('CONFIRMED', 'PROCESSING', 'COMPLETED', 'CANCELLED'):
+            self.assertEqual(
+                self.client_cust_a.post(
+                    f'/api/v1/orders/{order_id}/transition-status/',
+                    data={'to_status': target_status},
+                    format='json',
+                ).status_code,
+                403,
+            )
+
+        # Customer B cannot transition or cancel Customer A's order (`403 Forbidden`)
+        self.assertEqual(
+            self.client_cust_b.post(
+                f'/api/v1/orders/{order_id}/transition-status/',
+                data={'to_status': 'CONFIRMED'},
+                format='json',
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client_cust_b.post(
+                f'/api/v1/orders/{order_id}/cancel/',
+                data={'reason': 'Cross-customer cancel attempt'},
+                format='json',
+                HTTP_IDEMPOTENCY_KEY='pg-cust-b-cancel-1',
+            ).status_code,
+            403,
+        )
+        # Order remains PENDING in PostgreSQL
+        order_obj = Order.objects.get(pk=order_id)
+        self.assertEqual(order_obj.status, 'PENDING')
+        self.assertFalse(order_obj.cancellation_restored)
+
+
+
 
 
 

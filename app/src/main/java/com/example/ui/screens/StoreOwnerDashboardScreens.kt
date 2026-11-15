@@ -2582,8 +2582,7 @@ private fun StoreOwnerOrderManagementCard(
     onCancelOrder: () -> Unit
 ) {
     val order = orderWithItems.order
-    val status = order.orderStatus
-    val nonCancelTransitions = status.allowedNextStatuses().filter { it != OrderStatus.CANCELLED }
+    val nonCancelTransitions = order.allowedNextOrderStatuses().filter { it != OrderStatus.CANCELLED }
 
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -2625,7 +2624,7 @@ private fun StoreOwnerOrderManagementCard(
                 )
             }
 
-            if (nonCancelTransitions.isNotEmpty() || status.canBeCancelled) {
+            if (nonCancelTransitions.isNotEmpty() || order.canOrderBeCancelled) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     nonCancelTransitions.forEach { nextStatus ->
@@ -2638,14 +2637,18 @@ private fun StoreOwnerOrderManagementCard(
                                 .testTag("owner_order_transition_${order.id}_${nextStatus.name}")
                         ) {
                             Text(
-                                text = nextStatus.actionButtonArabic,
+                                text = if (order.isServerBacked) {
+                                    OrderStatus.serverActionButtonArabic(nextStatus.toServerStatusString())
+                                } else {
+                                    nextStatus.actionButtonArabic
+                                },
                                 color = White,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                     }
 
-                    if (status.canBeCancelled) {
+                    if (order.canOrderBeCancelled) {
                         OutlinedButton(
                             onClick = onCancelOrder,
                             border = BorderStroke(1.dp, AccentRed),
@@ -2665,7 +2668,7 @@ private fun StoreOwnerOrderManagementCard(
             } else {
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "حالة نهائية: ${status.arabicLabel} (لا تتوفر انتقالات إضافية)",
+                    text = "حالة نهائية: ${order.displayStatusArabic} (لا تتوفر انتقالات إضافية)",
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary,
                     fontWeight = FontWeight.SemiBold,
@@ -2685,8 +2688,7 @@ private fun StoreOwnerOrderDetailsPanel(
 ) {
     val order = orderWithItems.order
     val items = orderWithItems.items
-    val status = order.orderStatus
-    val nonCancelTransitions = status.allowedNextStatuses().filter { it != OrderStatus.CANCELLED }
+    val nonCancelTransitions = order.allowedNextOrderStatuses().filter { it != OrderStatus.CANCELLED }
 
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -2728,7 +2730,7 @@ private fun StoreOwnerOrderDetailsPanel(
 
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "الحالة الحالية: ${status.arabicLabel}",
+                text = "الحالة الحالية: ${order.displayStatusArabic}",
                 style = MaterialTheme.typography.bodyMedium,
                 color = FreshGreenDark,
                 fontWeight = FontWeight.Bold,
@@ -2817,7 +2819,7 @@ private fun StoreOwnerOrderDetailsPanel(
                 )
             }
 
-            if (nonCancelTransitions.isNotEmpty() || status.canBeCancelled) {
+            if (nonCancelTransitions.isNotEmpty() || order.canOrderBeCancelled) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
                     text = "تحديث حالة الطلب (الانتقالات المسموحة فقط):",
@@ -2837,13 +2839,17 @@ private fun StoreOwnerOrderDetailsPanel(
                                 .testTag("owner_order_detail_transition_${order.id}_${nextStatus.name}")
                         ) {
                             Text(
-                                text = nextStatus.actionButtonArabic,
+                                text = if (order.isServerBacked) {
+                                    OrderStatus.serverActionButtonArabic(nextStatus.toServerStatusString())
+                                } else {
+                                    nextStatus.actionButtonArabic
+                                },
                                 color = White,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                     }
-                    if (status.canBeCancelled) {
+                    if (order.canOrderBeCancelled) {
                         OutlinedButton(
                             onClick = onCancelOrder,
                             border = BorderStroke(1.dp, AccentRed),

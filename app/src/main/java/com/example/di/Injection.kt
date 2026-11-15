@@ -101,7 +101,8 @@ object Injection {
                 val db = provideDatabase(context)
                 OrderRepository(
                     database = db,
-                    checkoutMutex = sharedInventoryMutex
+                    checkoutMutex = sharedInventoryMutex,
+                    apiService = provideApiService(context)
                 ).also { orderRepository = it }
             }
         }

@@ -6,9 +6,13 @@ import com.example.data.api.model.AuthMeResponseDto
 import com.example.data.api.model.AuthRefreshRequestDto
 import com.example.data.api.model.AuthRegisterRequestDto
 import com.example.data.api.model.AuthTokenResponseDto
+import com.example.data.api.model.CancelOrderRequestDto
 import com.example.data.api.model.CategoryDto
+import com.example.data.api.model.CheckoutRequest
+import com.example.data.api.model.CheckoutResponse
 import com.example.data.api.model.OrderRequest
 import com.example.data.api.model.OrderResponse
+import com.example.data.api.model.OrderStatusTransitionRequestDto
 import com.example.data.api.model.ProductDto
 import com.example.data.auth.JwtSessionTokens
 import com.example.data.auth.SecureTokenStorage
@@ -25,10 +29,11 @@ import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
+import retrofit2.http.Query
 import java.io.IOException
-import java.time.Instant
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -44,6 +49,72 @@ interface FreshApiService {
 
     @POST("orders/")
     suspend fun createOrder(@Body request: OrderRequest): OrderResponse
+
+    /**
+     * Submits a server-authoritative checkout request (`POST /api/v1/orders/`) with an
+     * explicit `Idempotency-Key` header and returns the raw [retrofit2.Response] so the caller
+     * can inspect HTTP status codes (`201 Created`, `200 OK` replay, `400`, `401`, `403`,
+     * `409 Conflict`, `422 Unprocessable Entity`, `5xx`).
+     */
+    @POST("orders/")
+    suspend fun submitCheckout(
+        @Header(HEADER_IDEMPOTENCY_KEY) idempotencyKey: String,
+        @Body request: CheckoutRequest
+    ): retrofit2.Response<CheckoutResponse> {
+        val body = createOrder(request)
+        val statusCode = if (body.replayed == true) 200 else 201
+        return retrofit2.Response.success(statusCode, body)
+    }
+
+    /**
+     * Lists orders visible to the authenticated actor (`GET /api/v1/orders/`).
+     * - For `CUSTOMER`: returns only the customer's own orders.
+     * - For `OWNER` / `BRANCH_MANAGER`: returns orders scoped to the actor's authorized branches,
+     *   optionally filtered by [branchId] and/or [status].
+     */
+    @GET("orders/")
+    suspend fun getOrders(
+        @Query("branch_id") branchId: Int? = null,
+        @Query("status") status: String? = null
+    ): retrofit2.Response<List<OrderResponse>> {
+        throw UnsupportedOperationException("getOrders not implemented by test double")
+    }
+
+    /**
+     * Fetches a single order by ID (`GET /api/v1/orders/{id}/`) with object-level permission
+     * enforcement (`CUSTOMER` own order only; `OWNER`/`BRANCH_MANAGER` authorized branch only).
+     */
+    @GET("orders/{id}/")
+    suspend fun getOrderById(
+        @Path("id") orderId: Int
+    ): retrofit2.Response<OrderResponse> {
+        throw UnsupportedOperationException("getOrderById not implemented by test double")
+    }
+
+    /**
+     * Transitions an order's status on the server (`POST /api/v1/orders/{id}/transition-status/`).
+     * Restricted to authorized `OWNER` and `BRANCH_MANAGER` actors.
+     */
+    @POST("orders/{id}/transition-status/")
+    suspend fun transitionOrderStatus(
+        @Path("id") orderId: Int,
+        @Body request: OrderStatusTransitionRequestDto
+    ): retrofit2.Response<OrderResponse> {
+        throw UnsupportedOperationException("transitionOrderStatus not implemented by test double")
+    }
+
+    /**
+     * Cancels an order and restores stock atomically on the server (`POST /api/v1/orders/{id}/cancel/`).
+     * Restricted to authorized `OWNER` and `BRANCH_MANAGER` actors; requires an `Idempotency-Key`.
+     */
+    @POST("orders/{id}/cancel/")
+    suspend fun cancelOrder(
+        @Path("id") orderId: Int,
+        @Header(HEADER_IDEMPOTENCY_KEY) idempotencyKey: String,
+        @Body request: CancelOrderRequestDto
+    ): retrofit2.Response<OrderResponse> {
+        throw UnsupportedOperationException("cancelOrder not implemented by test double")
+    }
 
     @POST("auth/register/")
     suspend fun registerCustomer(@Body request: AuthRegisterRequestDto): AuthTokenResponseDto {
@@ -70,6 +141,10 @@ interface FreshApiService {
         @Body request: AuthLogoutRequestDto = AuthLogoutRequestDto()
     ): Map<String, String> {
         throw UnsupportedOperationException("logout not implemented by test double")
+    }
+
+    companion object {
+        const val HEADER_IDEMPOTENCY_KEY = "Idempotency-Key"
     }
 }
 
@@ -316,6 +391,36 @@ internal interface FreshRemoteEndpoints {
     @POST("orders/")
     suspend fun createOrder(@Body request: OrderRequest): OrderResponse
 
+    @POST("orders/")
+    suspend fun submitCheckout(
+        @Header(FreshApiService.HEADER_IDEMPOTENCY_KEY) idempotencyKey: String,
+        @Body request: CheckoutRequest
+    ): retrofit2.Response<CheckoutResponse>
+
+    @GET("orders/")
+    suspend fun getOrders(
+        @Query("branch_id") branchId: Int? = null,
+        @Query("status") status: String? = null
+    ): retrofit2.Response<List<OrderResponse>>
+
+    @GET("orders/{id}/")
+    suspend fun getOrderById(
+        @Path("id") orderId: Int
+    ): retrofit2.Response<OrderResponse>
+
+    @POST("orders/{id}/transition-status/")
+    suspend fun transitionOrderStatus(
+        @Path("id") orderId: Int,
+        @Body request: OrderStatusTransitionRequestDto
+    ): retrofit2.Response<OrderResponse>
+
+    @POST("orders/{id}/cancel/")
+    suspend fun cancelOrder(
+        @Path("id") orderId: Int,
+        @Header(FreshApiService.HEADER_IDEMPOTENCY_KEY) idempotencyKey: String,
+        @Body request: CancelOrderRequestDto
+    ): retrofit2.Response<OrderResponse>
+
     @POST("auth/register/")
     suspend fun registerCustomer(@Body request: AuthRegisterRequestDto): AuthTokenResponseDto
 
@@ -379,6 +484,26 @@ object FreshRetrofitClient {
             override suspend fun getProducts(): List<ProductDto> = remote.getProducts()
             override suspend fun getProduct(id: Int): ProductDto = remote.getProduct(id)
             override suspend fun createOrder(request: OrderRequest): OrderResponse = remote.createOrder(request)
+            override suspend fun submitCheckout(
+                idempotencyKey: String,
+                request: CheckoutRequest
+            ): retrofit2.Response<CheckoutResponse> = remote.submitCheckout(idempotencyKey, request)
+            override suspend fun getOrders(
+                branchId: Int?,
+                status: String?
+            ): retrofit2.Response<List<OrderResponse>> = remote.getOrders(branchId, status)
+            override suspend fun getOrderById(
+                orderId: Int
+            ): retrofit2.Response<OrderResponse> = remote.getOrderById(orderId)
+            override suspend fun transitionOrderStatus(
+                orderId: Int,
+                request: OrderStatusTransitionRequestDto
+            ): retrofit2.Response<OrderResponse> = remote.transitionOrderStatus(orderId, request)
+            override suspend fun cancelOrder(
+                orderId: Int,
+                idempotencyKey: String,
+                request: CancelOrderRequestDto
+            ): retrofit2.Response<OrderResponse> = remote.cancelOrder(orderId, idempotencyKey, request)
             override suspend fun registerCustomer(request: AuthRegisterRequestDto): AuthTokenResponseDto =
                 remote.registerCustomer(request)
             override suspend fun login(request: AuthLoginRequestDto): AuthTokenResponseDto =
@@ -414,4 +539,3 @@ object FreshRetrofitClient {
         return createService(baseUrl = baseUrl, client = client) to interceptor
     }
 }
-

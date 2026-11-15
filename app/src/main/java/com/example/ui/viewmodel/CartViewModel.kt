@@ -12,6 +12,7 @@ import com.example.data.repository.CartRepository
 import com.example.data.repository.CheckoutFailureReason
 import com.example.data.repository.CheckoutOutcome
 import com.example.data.repository.OrderRepository
+import com.example.data.repository.OrderSyncOutcome
 import com.example.data.repository.OrderWithItems
 import com.example.data.repository.ProductRepository
 import kotlinx.coroutines.flow.Flow
@@ -72,6 +73,20 @@ class CartViewModel(
     val capturedPriceSnapshot: StateFlow<Map<Int, Int>?> = _capturedPriceSnapshot.asStateFlow()
 
     private var currentCheckoutIdempotencyKey: String = generateIdempotencyKey()
+    private var boundCartFingerprintForKey: String? = null
+
+    /**
+     * Exposes the active `Idempotency-Key` for the current logical checkout attempt.
+     *
+     * Invariant (Microtask 1D.3):
+     * - Remains constant across retries of the same logical order (when the cart items/quantities
+     *   have not been modified).
+     * - Rotates only when the cart contents change (`addToCartMillis`, `removeFromCart`), when a
+     *   completed order confirmation is dismissed (`dismissOrderConfirmation`), or when the server
+     *   reports an `IDEMPOTENCY_CONFLICT` (`409`).
+     */
+    val activeCheckoutIdempotencyKey: String
+        get() = currentCheckoutIdempotencyKey
 
     /**
      * Detailed cart line items combining Room cart items with latest product states.
@@ -142,18 +157,25 @@ class CartViewModel(
         _lastCompletedOrder.value = null
         _cartErrorMessage.value = null
         currentCheckoutIdempotencyKey = generateIdempotencyKey()
+        boundCartFingerprintForKey = null
     }
 
     /**
      * Captures the current unit prices (in halalas) of items in the cart when entering the checkout confirmation step
      * so stale prices can be detected if a product's price changes before order submission.
+     * Preserves [currentCheckoutIdempotencyKey] if the cart contents have not changed since the key was issued.
      */
     fun captureCheckoutPriceSnapshot() {
-        val snapshot = detailedCartItems.value.associate { it.product.id to it.product.priceHalalas }
+        val currentItems = detailedCartItems.value
+        val snapshot = currentItems.associate { it.product.id to it.product.priceHalalas }
         if (snapshot.isNotEmpty()) {
             _capturedPriceSnapshot.value = snapshot
         }
-        currentCheckoutIdempotencyKey = generateIdempotencyKey()
+        val fingerprint = computeCartFingerprint(currentItems.map { it.cartItem })
+        if (boundCartFingerprintForKey != null && boundCartFingerprintForKey != fingerprint) {
+            currentCheckoutIdempotencyKey = generateIdempotencyKey()
+        }
+        boundCartFingerprintForKey = fingerprint
     }
 
     fun addToCart(productId: Int, quantity: Int) {
@@ -207,6 +229,7 @@ class CartViewModel(
             }
             cartRepository.addToCart(cartItem)
             currentCheckoutIdempotencyKey = generateIdempotencyKey()
+            boundCartFingerprintForKey = null
         }
     }
 
@@ -223,20 +246,29 @@ class CartViewModel(
             cartRepository.removeFromCart(productId)
             _cartErrorMessage.value = null
             currentCheckoutIdempotencyKey = generateIdempotencyKey()
+            boundCartFingerprintForKey = null
         }
     }
 
     /**
-     * Executes atomic local checkout via [OrderRepository] and updates UI state.
+     * Executes checkout via [OrderRepository] and updates UI state ONLY after confirmation.
+     *
+     * - When [OrderRepository.hasRemoteCheckoutApi] is `true`, executes server-authoritative checkout
+     *   against `POST /api/v1/orders/` ([OrderRepository.executeServerCheckout]).
+     * - Reuses the exact same [currentCheckoutIdempotencyKey] across retries of the same logical order
+     *   (never generating a new key on retry unless the cart items changed or an idempotency conflict occurred).
+     * - Never sets [lastCompletedOrder] before receiving a confirmed `201 Created` or `200 OK` response.
      */
     suspend fun executeCheckout(
         customer: AuthenticatedUser? = null,
         idempotencyKeyOverride: String? = null,
-        expectedPricesOverride: Map<Int, Int>? = _capturedPriceSnapshot.value
+        expectedPricesOverride: Map<Int, Int>? = _capturedPriceSnapshot.value,
+        branchId: Int = OrderRepository.DEFAULT_BRANCH_ID,
+        fulfillmentWarehouseId: Int? = null
     ): CheckoutOutcome {
         val repo = orderRepository ?: return CheckoutOutcome.Failure(
             reason = CheckoutFailureReason.TRANSACTION_ERROR,
-            messageArabic = "خدمة إتمام الطلب المحلي غير مهيأة."
+            messageArabic = "خدمة إتمام الطلب غير مهيأة."
         )
 
         if (_isSubmittingCheckout.value && idempotencyKeyOverride == null) {
@@ -246,19 +278,40 @@ class CartViewModel(
             )
         }
 
+        // Rotate idempotency key ONLY if the cart items have changed since the current key was bound
+        val currentRawCartItems = cartRepository.getCartItemsOnce()
+        if (currentRawCartItems.isNotEmpty() && idempotencyKeyOverride == null) {
+            val fingerprint = computeCartFingerprint(currentRawCartItems)
+            if (boundCartFingerprintForKey != null && boundCartFingerprintForKey != fingerprint) {
+                currentCheckoutIdempotencyKey = generateIdempotencyKey()
+            }
+            boundCartFingerprintForKey = fingerprint
+        }
+
         _isSubmittingCheckout.value = true
         return try {
             val effectiveKey = idempotencyKeyOverride ?: currentCheckoutIdempotencyKey
-            val outcome = repo.executeLocalCheckout(
-                customerId = customer?.id ?: OrderRepository.GUEST_CUSTOMER_ID,
-                customerName = customer?.fullName ?: "متسوق محلي",
-                actorRole = customer?.role?.name ?: UserRole.CUSTOMER.name,
-                deliveryAddress = _deliveryAddress.value,
-                deliveryFeeHalalas = deliveryFee.toInt(),
-                discountHalalas = _discountHalalas.value.toInt(),
-                expectedUnitPricesHalalas = expectedPricesOverride,
-                idempotencyKey = effectiveKey
-            )
+            val outcome = if (repo.hasRemoteCheckoutApi) {
+                repo.executeServerCheckout(
+                    branchId = branchId,
+                    fulfillmentWarehouseId = fulfillmentWarehouseId,
+                    idempotencyKey = effectiveKey,
+                    customerName = customer?.fullName ?: "عميل فريش",
+                    deliveryAddress = _deliveryAddress.value,
+                    fallbackCustomerId = customer?.customerId ?: customer?.id ?: OrderRepository.GUEST_CUSTOMER_ID
+                )
+            } else {
+                repo.executeLocalCheckout(
+                    customerId = customer?.id ?: OrderRepository.GUEST_CUSTOMER_ID,
+                    customerName = customer?.fullName ?: "متسوق محلي",
+                    actorRole = customer?.role?.name ?: UserRole.CUSTOMER.name,
+                    deliveryAddress = _deliveryAddress.value,
+                    deliveryFeeHalalas = deliveryFee.toInt(),
+                    discountHalalas = _discountHalalas.value.toInt(),
+                    expectedUnitPricesHalalas = expectedPricesOverride,
+                    idempotencyKey = effectiveKey
+                )
+            }
 
             when (outcome) {
                 is CheckoutOutcome.Success -> {
@@ -268,16 +321,20 @@ class CartViewModel(
                 }
                 is CheckoutOutcome.Failure -> {
                     _cartErrorMessage.value = outcome.messageArabic
-                    // Refresh captured price snapshot from latest DB state so user sees updated prices/stock
                     val refreshedSnapshot = detailedCartItems.value.associate {
                         it.product.id to it.product.priceHalalas
                     }
                     if (refreshedSnapshot.isNotEmpty()) {
                         _capturedPriceSnapshot.value = refreshedSnapshot
                     }
-                    // Allow retrying with a new idempotency key after fixing the cart or reviewing updated prices
-                    if (outcome.reason != CheckoutFailureReason.DUPLICATE_SUBMISSION) {
+                    // Preserve currentCheckoutIdempotencyKey for retries of the same logical order!
+                    // Only rotate the key if the server explicitly rejected the key as an IDEMPOTENCY_CONFLICT
+                    // (or in legacy local mode when a non-duplicate validation failure occurred).
+                    if (outcome.reason == CheckoutFailureReason.IDEMPOTENCY_CONFLICT ||
+                        (!repo.hasRemoteCheckoutApi && outcome.reason != CheckoutFailureReason.DUPLICATE_SUBMISSION)
+                    ) {
                         currentCheckoutIdempotencyKey = generateIdempotencyKey()
+                        boundCartFingerprintForKey = null
                     }
                 }
             }
@@ -302,8 +359,90 @@ class CartViewModel(
     private val _selectedCustomerOrderId = MutableStateFlow<Int?>(null)
     val selectedCustomerOrderId: StateFlow<Int?> = _selectedCustomerOrderId.asStateFlow()
 
-    fun selectCustomerOrderForDetails(orderId: Int?) {
+    private val _isOrderSyncInProgress = MutableStateFlow(false)
+    val isOrderSyncInProgress: StateFlow<Boolean> = _isOrderSyncInProgress.asStateFlow()
+
+    private val _orderSyncError = MutableStateFlow<String?>(null)
+    val orderSyncError: StateFlow<String?> = _orderSyncError.asStateFlow()
+
+    fun selectCustomerOrderForDetails(
+        orderId: Int?,
+        actor: AuthenticatedUser? = null
+    ) {
         _selectedCustomerOrderId.value = orderId
+        if (orderId != null && actor != null && orderRepository?.hasRemoteCheckoutApi == true) {
+            viewModelScope.launch {
+                syncCustomerOrderDetailsFromServer(orderId = orderId, actor = actor)
+            }
+        }
+    }
+
+    /**
+     * Synchronizes the authenticated customer's orders from `GET /api/v1/orders/` into Room.
+     * Preserves existing Room cache on network outages and surfaces an Arabic error message.
+     */
+    suspend fun syncCustomerOrdersFromServer(
+        actor: AuthenticatedUser?,
+        statusFilter: String? = null
+    ): OrderSyncOutcome {
+        val repo = orderRepository ?: return OrderSyncOutcome.Failure(
+            reason = com.example.data.repository.OrderTransitionFailureReason.NETWORK_ERROR,
+            messageArabic = "خدمة مزامنة الطلبات غير مهيأة."
+        )
+        _isOrderSyncInProgress.value = true
+        return try {
+            val outcome = repo.syncCustomerOrdersFromServer(actor = actor, statusFilter = statusFilter)
+            when (outcome) {
+                is OrderSyncOutcome.Success -> {
+                    _orderSyncError.value = null
+                }
+                is OrderSyncOutcome.Failure -> {
+                    _orderSyncError.value = outcome.messageArabic
+                }
+            }
+            outcome
+        } finally {
+            _isOrderSyncInProgress.value = false
+        }
+    }
+
+    /**
+     * Synchronizes a single customer order (`GET /api/v1/orders/{id}/`) from the server into Room,
+     * including the latest server status (`PENDING`, `CONFIRMED`, `PROCESSING`, `COMPLETED`, `CANCELLED`)
+     * and `status_history`.
+     */
+    suspend fun syncCustomerOrderDetailsFromServer(
+        orderId: Int,
+        actor: AuthenticatedUser?
+    ): OrderSyncOutcome {
+        val repo = orderRepository ?: return OrderSyncOutcome.Failure(
+            reason = com.example.data.repository.OrderTransitionFailureReason.NETWORK_ERROR,
+            messageArabic = "خدمة مزامنة الطلبات غير مهيأة."
+        )
+        _isOrderSyncInProgress.value = true
+        return try {
+            val outcome = repo.syncOrderDetailsFromServer(orderId = orderId, actor = actor)
+            when (outcome) {
+                is OrderSyncOutcome.Success -> {
+                    _orderSyncError.value = null
+                }
+                is OrderSyncOutcome.Failure -> {
+                    _orderSyncError.value = outcome.messageArabic
+                }
+            }
+            outcome
+        } finally {
+            _isOrderSyncInProgress.value = false
+        }
+    }
+
+    fun refreshCustomerOrdersFromServer(
+        actor: AuthenticatedUser?,
+        statusFilter: String? = null
+    ) {
+        viewModelScope.launch {
+            syncCustomerOrdersFromServer(actor = actor, statusFilter = statusFilter)
+        }
     }
 
     fun observeOrdersForCustomer(
@@ -335,6 +474,12 @@ class CartViewModel(
 
     fun observeAllOrdersForStoreManagement(actor: AuthenticatedUser?): Flow<List<OrderWithItems>> {
         return orderRepository?.getAllOrdersWithItemsForStoreManagement(actor) ?: flowOf(emptyList())
+    }
+
+    private fun computeCartFingerprint(items: List<CartItem>): String {
+        return items
+            .sortedBy { it.productId }
+            .joinToString("|") { "${it.productId}:${it.effectiveQuantityMillis}" }
     }
 
     private fun generateIdempotencyKey(): String = "chk_${UUID.randomUUID()}"

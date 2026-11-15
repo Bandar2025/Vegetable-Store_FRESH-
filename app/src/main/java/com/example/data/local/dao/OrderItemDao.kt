@@ -18,6 +18,9 @@ interface OrderItemDao {
     @Query("SELECT * FROM order_items ORDER BY id ASC")
     fun getAllOrderItems(): Flow<List<OrderItem>>
 
+    @Query("DELETE FROM order_items WHERE orderId = :orderId")
+    suspend fun deleteOrderItemsForOrder(orderId: Int)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(orderItem: OrderItem): Long
 

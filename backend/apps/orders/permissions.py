@@ -22,16 +22,15 @@ except ImportError:
         def has_object_permission(self, request, view, obj) -> bool:
             return True
 
+from apps.orders.auth import (
+    enforce_no_client_identity_spoofing,
+    resolve_service_actor_from_user,
+)
+
 try:
-    from apps.orders.auth import (
-        enforce_no_client_identity_spoofing,
-        resolve_service_actor_from_user,
-    )
     from apps.orders.models import Order
 except ImportError:
     Order = object  # type: ignore[assignment,misc]
-    enforce_no_client_identity_spoofing = None  # type: ignore[assignment]
-    resolve_service_actor_from_user = None  # type: ignore[assignment]
 
 from apps.orders.services import (
     ActorRole,

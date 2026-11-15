@@ -11,6 +11,7 @@ import com.example.data.local.model.Product
 import com.example.data.local.model.ProductExpiryStatus
 import com.example.data.local.model.StockAdjustment
 import com.example.data.repository.OrderRepository
+import com.example.data.repository.OrderSyncOutcome
 import com.example.data.repository.OrderTransitionFailureReason
 import com.example.data.repository.OrderTransitionOutcome
 import com.example.data.repository.OrderWithItems
@@ -352,16 +353,24 @@ class StoreManagementViewModel(
     private val _selectedOrderStatusFilter = MutableStateFlow<OrderStatus?>(null)
     val selectedOrderStatusFilter: StateFlow<OrderStatus?> = _selectedOrderStatusFilter.asStateFlow()
 
+    private val _selectedBranchIdFilter = MutableStateFlow<Int?>(null)
+    val selectedBranchIdFilter: StateFlow<Int?> = _selectedBranchIdFilter.asStateFlow()
+
+    private val _isOrderSyncInProgress = MutableStateFlow(false)
+    val isOrderSyncInProgress: StateFlow<Boolean> = _isOrderSyncInProgress.asStateFlow()
+
     private val _selectedOrderId = MutableStateFlow<Int?>(null)
     val selectedOrderId: StateFlow<Int?> = _selectedOrderId.asStateFlow()
 
     /**
      * Returns persisted orders only when [actor] has verified store-management privileges ([AccessControlPolicy]).
-     * Optionally filters by [statusFilter] (when non-null).
+     * Optionally filters by [statusFilter] and [branchIdFilter] (when non-null).
+     * Also enforces client-side branch scoping for `STORE_ADMIN` (`BRANCH_MANAGER`) when `authorizedBranchIds` is present.
      */
     fun getVisibleOrdersForActor(
         actor: AuthenticatedUser?,
-        statusFilter: OrderStatus? = null
+        statusFilter: OrderStatus? = null,
+        branchIdFilter: Int? = _selectedBranchIdFilter.value
     ): List<OrderWithItems> {
         val decision = AccessControlPolicy.checkAccess(
             user = actor,
@@ -371,7 +380,21 @@ class StoreManagementViewModel(
         if (decision !is AccessControlDecision.Allowed) {
             return emptyList()
         }
-        val allVisible = _storeOrders.value
+        val authorizedBranches = actor?.authorizedBranchIds
+        val allVisible = _storeOrders.value.filter { orderWithItems ->
+            val ob = orderWithItems.branchId
+            val branchMatchesAuth = if (!authorizedBranches.isNullOrEmpty() && ob != null && ob > 0) {
+                ob in authorizedBranches
+            } else {
+                true
+            }
+            val branchMatchesFilter = if (branchIdFilter != null && ob != null && ob > 0) {
+                ob == branchIdFilter
+            } else {
+                true
+            }
+            branchMatchesAuth && branchMatchesFilter
+        }
         return if (statusFilter == null) {
             allVisible
         } else {
@@ -380,10 +403,15 @@ class StoreManagementViewModel(
     }
 
     /**
-     * Returns orders filtered by the currently selected [selectedOrderStatusFilter] for an authorized store actor.
+     * Returns orders filtered by the currently selected [selectedOrderStatusFilter] and [selectedBranchIdFilter]
+     * for an authorized store actor.
      */
     fun getFilteredOrdersForActor(actor: AuthenticatedUser?): List<OrderWithItems> {
-        return getVisibleOrdersForActor(actor = actor, statusFilter = _selectedOrderStatusFilter.value)
+        return getVisibleOrdersForActor(
+            actor = actor,
+            statusFilter = _selectedOrderStatusFilter.value,
+            branchIdFilter = _selectedBranchIdFilter.value
+        )
     }
 
     /**
@@ -391,13 +419,18 @@ class StoreManagementViewModel(
      */
     fun getSelectedOrderForActor(actor: AuthenticatedUser?): OrderWithItems? {
         val targetOrderId = _selectedOrderId.value ?: return null
-        return getVisibleOrdersForActor(actor = actor, statusFilter = null)
+        return getVisibleOrdersForActor(actor = actor, statusFilter = null, branchIdFilter = null)
             .find { it.order.id == targetOrderId }
     }
 
     fun selectOrderStatusFilter(status: OrderStatus?) {
         _errorMessage.value = null
         _selectedOrderStatusFilter.value = status
+    }
+
+    fun selectBranchFilter(branchId: Int?) {
+        _errorMessage.value = null
+        _selectedBranchIdFilter.value = branchId
     }
 
     fun openOrderDetails(orderId: Int) {
@@ -408,6 +441,90 @@ class StoreManagementViewModel(
     fun closeOrderDetails() {
         _errorMessage.value = null
         _selectedOrderId.value = null
+    }
+
+    /**
+     * Synchronizes branch-scoped store orders (`GET /api/v1/orders/`) from the Django server into Room.
+     * Enforces store-management authorization and surfaces server errors (including `403 Forbidden` for
+     * unauthorized branch access) or network failures in [errorMessage] while preserving Room cache.
+     */
+    suspend fun syncStoreOrdersFromServer(
+        actor: AuthenticatedUser?,
+        branchId: Int? = _selectedBranchIdFilter.value,
+        status: String? = null
+    ): OrderSyncOutcome {
+        val repo = orderRepository ?: return OrderSyncOutcome.Failure(
+            reason = OrderTransitionFailureReason.NETWORK_ERROR,
+            messageArabic = "خدمة إدارة الطلبات غير مهيأة."
+        )
+        _isOrderSyncInProgress.value = true
+        return try {
+            val outcome = repo.syncStoreOrdersFromServer(
+                actor = actor,
+                branchId = branchId,
+                status = status
+            )
+            when (outcome) {
+                is OrderSyncOutcome.Success -> {
+                    _errorMessage.value = null
+                }
+                is OrderSyncOutcome.Failure -> {
+                    _errorMessage.value = outcome.messageArabic
+                }
+            }
+            outcome
+        } finally {
+            _isOrderSyncInProgress.value = false
+        }
+    }
+
+    fun refreshStoreOrdersFromServer(
+        actor: AuthenticatedUser?,
+        branchId: Int? = _selectedBranchIdFilter.value,
+        status: String? = null
+    ) {
+        viewModelScope.launch {
+            syncStoreOrdersFromServer(actor = actor, branchId = branchId, status = status)
+        }
+    }
+
+    /**
+     * Executes a server-authoritative order status transition (`PENDING -> CONFIRMED -> PROCESSING -> COMPLETED`,
+     * or `CANCELLED`) via [OrderRepository.transitionOrderStatusToServerStatus] and updates UI feedback banners.
+     */
+    suspend fun executeServerOrderStatusTransition(
+        actor: AuthenticatedUser?,
+        orderId: Int,
+        targetServerStatus: String,
+        reasonNote: String = "",
+        idempotencyKey: String? = null
+    ): OrderTransitionOutcome {
+        val repo = orderRepository
+        if (repo == null) {
+            val msg = "خدمة إدارة الطلبات غير مهيأة."
+            _errorMessage.value = msg
+            return OrderTransitionOutcome.Failure(
+                reason = OrderTransitionFailureReason.TRANSACTION_ERROR,
+                messageArabic = msg
+            )
+        }
+        val outcome = repo.transitionOrderStatusToServerStatus(
+            orderId = orderId,
+            toServerStatus = targetServerStatus,
+            actor = actor,
+            reasonNote = reasonNote,
+            idempotencyKey = idempotencyKey
+        )
+        when (outcome) {
+            is OrderTransitionOutcome.Success -> {
+                _errorMessage.value = null
+                _statusBannerMessage.value = outcome.messageArabic
+            }
+            is OrderTransitionOutcome.Failure -> {
+                _errorMessage.value = outcome.messageArabic
+            }
+        }
+        return outcome
     }
 
     /**
@@ -477,9 +594,24 @@ class StoreManagementViewModel(
                     "لا يمكن إلغاء الطلب ${currentSnapshot.displayOrderNumber} بعد اكتماله وتوصيله."
                 return false
             }
-            if (!currentStatus.canTransitionTo(targetStatus)) {
+            val isAllowed = if (currentSnapshot.isServerBacked) {
+                targetStatus in currentSnapshot.allowedNextOrderStatuses()
+            } else {
+                currentStatus.canTransitionTo(targetStatus)
+            }
+            if (!isAllowed) {
+                val fromLabel = if (currentSnapshot.isServerBacked) {
+                    currentSnapshot.displayStatusArabic
+                } else {
+                    currentStatus.arabicLabel
+                }
+                val toLabel = if (currentSnapshot.isServerBacked) {
+                    OrderStatus.serverStatusArabicLabel(targetStatus.toServerStatusString())
+                } else {
+                    targetStatus.arabicLabel
+                }
                 _errorMessage.value =
-                    "انتقال حالة غير صالح للطلب ${currentSnapshot.displayOrderNumber}: لا يمكن الانتقال من «${currentStatus.arabicLabel}» إلى «${targetStatus.arabicLabel}»."
+                    "انتقال حالة غير صالح للطلب ${currentSnapshot.displayOrderNumber}: لا يمكن الانتقال من «$fromLabel» إلى «$toLabel»."
                 return false
             }
         }

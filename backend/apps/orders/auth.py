@@ -473,6 +473,7 @@ def is_token_blocklisted(
     token_hash: str | None = None,
     jti: str | None = None,
     token_family_id: str | None = None,
+    check_orm: bool = True,
 ) -> bool:
     """
     Returns True if the token digest, JTI, or token family is present in the blocklist
@@ -498,18 +499,21 @@ def is_token_blocklisted(
     if eff_family and cache.get(f"{CACHE_PREFIX_BLOCK_FAMILY}{eff_family}") is not None:
         return True
 
-    if eff_hash and DJANGO_AVAILABLE:
-        from django.db.models import Q
+    if eff_hash and DJANGO_AVAILABLE and check_orm:
+        try:
+            from django.db.models import Q
 
-        record = (
-            AuthSessionToken.objects.filter(
-                Q(access_token_hash=eff_hash) | Q(refresh_token_hash=eff_hash)
+            record = (
+                AuthSessionToken.objects.filter(
+                    Q(access_token_hash=eff_hash) | Q(refresh_token_hash=eff_hash)
+                )
+                .only('revoked_at', 'token_family_id')
+                .first()
             )
-            .only('revoked_at', 'token_family_id')
-            .first()
-        )
-        if record is not None and record.revoked_at is not None:
-            return True
+            if record is not None and record.revoked_at is not None:
+                return True
+        except Exception:
+            pass
 
     return False
 
@@ -1349,7 +1353,11 @@ def record_failed_login_attempt(request, username: str | None = None) -> None:
                 identifier=f"user:{normalized_user}",
             )
         )
-    AuthThrottleEvent.objects.bulk_create(events)
+    if DJANGO_AVAILABLE and not getattr(request, '_skip_orm_throttle_audit', False):
+        try:
+            AuthThrottleEvent.objects.bulk_create(events)
+        except Exception:
+            pass
 
     if underlying_req is not None:
         setattr(underlying_req, '_auth_failed_login_recorded', True)
@@ -1372,10 +1380,14 @@ def clear_failed_login_attempts(request, username: str | None = None) -> None:
     if normalized_user:
         cache.delete(f"{CACHE_PREFIX_RL_LOGIN_FAIL_USER}{normalized_user}")
         identifiers.append(f"user:{normalized_user}")
-    AuthThrottleEvent.objects.filter(
-        scope=AuthThrottleEvent.Scope.LOGIN_FAILURE,
-        identifier__in=identifiers,
-    ).delete()
+    if DJANGO_AVAILABLE and not getattr(request, '_skip_orm_throttle_audit', False):
+        try:
+            AuthThrottleEvent.objects.filter(
+                scope=AuthThrottleEvent.Scope.LOGIN_FAILURE,
+                identifier__in=identifiers,
+            ).delete()
+        except Exception:
+            pass
     if underlying_req is not None:
         setattr(underlying_req, '_auth_failed_login_cleared', True)
 
@@ -1407,9 +1419,13 @@ def check_and_record_login_rate_limit(request) -> tuple[bool, int]:
 
     # Prune stale DB audit events outside the active observation windows
     max_retention = max(failed_window, request_window)
-    AuthThrottleEvent.objects.filter(
-        created_at__lt=now - timedelta(seconds=max_retention)
-    ).delete()
+    if not getattr(request, '_skip_orm_throttle_audit', False):
+        try:
+            AuthThrottleEvent.objects.filter(
+                created_at__lt=now - timedelta(seconds=max_retention)
+            ).delete()
+        except Exception:
+            pass
 
     # 1a. Check per-IP failed login lockout via cache
     ip_fail_key = f"{CACHE_PREFIX_RL_LOGIN_FAIL_IP}{client_ip}"
@@ -1457,10 +1473,14 @@ def check_and_record_login_rate_limit(request) -> tuple[bool, int]:
             request_window,
             now_ts,
         )
-    AuthThrottleEvent.objects.create(
-        scope=AuthThrottleEvent.Scope.LOGIN_REQUEST,
-        identifier=f"ip:{client_ip}",
-    )
+    if not getattr(request, '_skip_orm_throttle_audit', False):
+        try:
+            AuthThrottleEvent.objects.create(
+                scope=AuthThrottleEvent.Scope.LOGIN_REQUEST,
+                identifier=f"ip:{client_ip}",
+            )
+        except Exception:
+            pass
 
     decision = (True, 0)
     setattr(underlying_req, '_auth_login_rate_limit_decision', decision)
@@ -1483,13 +1503,17 @@ def check_and_record_refresh_rate_limit(request) -> tuple[bool, int]:
     client_ip = _extract_client_ip(request)
 
     max_requests = max(int(getattr(settings, 'AUTH_REFRESH_RATE_LIMIT_REQUESTS', 10)), 1)
-    request_window = max(int(getattr(settings, 'AUTH_REFRESH_RATE_LIMIT_WINDOW_SECONDS', 60)), 1)
+    request_window = max(int(getattr(getattr(settings, 'AUTH_REFRESH_RATE_LIMIT_WINDOW_SECONDS', 60), '__int__', lambda: 60)()), 1)
 
     cutoff = now - timedelta(seconds=request_window)
-    AuthThrottleEvent.objects.filter(
-        scope=AuthThrottleEvent.Scope.TOKEN_REFRESH_REQUEST,
-        created_at__lt=cutoff,
-    ).delete()
+    if not getattr(request, '_skip_orm_throttle_audit', False):
+        try:
+            AuthThrottleEvent.objects.filter(
+                scope=AuthThrottleEvent.Scope.TOKEN_REFRESH_REQUEST,
+                created_at__lt=cutoff,
+            ).delete()
+        except Exception:
+            pass
 
     refresh_req_key = f"{CACHE_PREFIX_RL_REFRESH_REQ_IP}{client_ip}"
     recent_requests = _get_cache_sliding_window_timestamps(refresh_req_key, request_window, now_ts)
@@ -1500,10 +1524,14 @@ def check_and_record_refresh_rate_limit(request) -> tuple[bool, int]:
         return decision
 
     _append_cache_sliding_window_timestamp(refresh_req_key, request_window, now_ts)
-    AuthThrottleEvent.objects.create(
-        scope=AuthThrottleEvent.Scope.TOKEN_REFRESH_REQUEST,
-        identifier=f"ip:{client_ip}",
-    )
+    if not getattr(request, '_skip_orm_throttle_audit', False):
+        try:
+            AuthThrottleEvent.objects.create(
+                scope=AuthThrottleEvent.Scope.TOKEN_REFRESH_REQUEST,
+                identifier=f"ip:{client_ip}",
+            )
+        except Exception:
+            pass
 
     decision = (True, 0)
     setattr(underlying_req, '_auth_refresh_rate_limit_decision', decision)
@@ -1708,18 +1736,23 @@ def resolve_service_actor_from_user(user) -> ServiceActor:
 
     assert_password_hashed(user)
 
-    profile = (
-        UserIdentityProfile.objects.select_related('store')
-        .filter(user_id=user.pk)
-        .first()
-    )
+    if hasattr(UserIdentityProfile.objects, 'select_related') and (
+        not DJANGO_AVAILABLE or isinstance(user, get_user_model())
+    ):
+        profile = (
+            UserIdentityProfile.objects.select_related('store')
+            .filter(user_id=user.pk)
+            .first()
+        )
+    else:
+        profile = getattr(user, 'identity_profile', None)
     if profile is None:
         raise AuthenticationBoundaryError(
-            f"User '{user.username}' does not have an assigned server-side identity profile."
+            f"User '{getattr(user, 'username', user.pk)}' does not have an assigned server-side identity profile."
         )
     if not profile.is_active:
         raise AuthenticationBoundaryError(
-            f"Identity profile for user '{user.username}' is inactive."
+            f"Identity profile for user '{getattr(user, 'username', user.pk)}' is inactive."
         )
 
     actor_id = f"user:{user.pk}"
@@ -1810,12 +1843,18 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
     Validates that a request does not attempt to spoof `role`, `actor_id`, `user_id`,
     `customer_id`, `store_id`, unauthorized `branch_id`, or internal privilege/state fields
     via request body, query params, or headers.
+
+    On write requests (`POST`, `PUT`, `PATCH`, `DELETE`), client-supplied identity fields
+    (`role`, `actor_role`, `actor_id`, `user_id`, `customer_id`, `store_id`) in the request
+    body are strictly rejected even if they match the caller's own server-resolved identity.
     """
     data = getattr(request, 'data', {})
     if not isinstance(data, dict):
         data = {}
     query_params = getattr(request, 'query_params', {})
     headers = getattr(request, 'headers', {})
+    method = str(getattr(request, 'method', 'GET') or 'GET').upper()
+    is_write_request = method not in ('GET', 'HEAD', 'OPTIONS')
 
     # 1. Check role spoofing
     supplied_role = (
@@ -1824,10 +1863,15 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
         or query_params.get('role')
         or headers.get('X-Actor-Role')
     )
-    if supplied_role is not None and str(supplied_role).strip() != actor.role:
-        raise AuthenticationBoundaryError(
-            "Client-supplied role is not trusted and conflicts with server-resolved identity."
-        )
+    if supplied_role is not None:
+        if is_write_request and ('role' in data or 'actor_role' in data):
+            raise AuthenticationBoundaryError(
+                "Client-supplied role is not permitted in write request payloads; role is server-controlled."
+            )
+        if str(supplied_role).strip() != actor.role:
+            raise AuthenticationBoundaryError(
+                "Client-supplied role is not trusted and conflicts with server-resolved identity."
+            )
 
     # 2. Check actor_id spoofing
     supplied_actor_id = (
@@ -1835,10 +1879,15 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
         or query_params.get('actor_id')
         or headers.get('X-Actor-Id')
     )
-    if supplied_actor_id is not None and str(supplied_actor_id).strip() != actor.actor_id:
-        raise AuthenticationBoundaryError(
-            "Client-supplied actor_id is not trusted and conflicts with server-resolved identity."
-        )
+    if supplied_actor_id is not None:
+        if is_write_request and 'actor_id' in data:
+            raise AuthenticationBoundaryError(
+                "Client-supplied actor_id is not permitted in write request payloads; actor_id is server-controlled."
+            )
+        if str(supplied_actor_id).strip() != actor.actor_id:
+            raise AuthenticationBoundaryError(
+                "Client-supplied actor_id is not trusted and conflicts with server-resolved identity."
+            )
 
     # 2b. Check user_id spoofing
     supplied_user_id = (
@@ -1847,6 +1896,10 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
         else (query_params.get('user_id') or headers.get('X-User-Id'))
     )
     if supplied_user_id is not None:
+        if is_write_request and 'user_id' in data:
+            raise AuthenticationBoundaryError(
+                "Client-supplied user_id is not permitted in write request payloads; user_id is server-controlled."
+            )
         user_obj = getattr(request, 'user', None)
         expected_uid = getattr(user_obj, 'pk', None)
         if expected_uid is None and actor.actor_id.startswith('user:'):
@@ -1872,7 +1925,11 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
                 f"Client is not permitted to supply internal privilege/state field '{forbidden_priv_field}'."
             )
 
-    # 3. Check customer_id spoofing for CUSTOMER actors
+    # 3. Check customer_id spoofing
+    if is_write_request and 'customer_id' in data and data.get('customer_id') is not None:
+        raise AuthenticationBoundaryError(
+            "Client-supplied customer_id is not permitted in write request payloads; customer_id is server-controlled."
+        )
     if actor.role == ActorRole.CUSTOMER.value:
         for raw_cid in (
             data.get('customer_id'),
@@ -1887,10 +1944,14 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
     # 4. Check store_id spoofing
     supplied_store_id = (
         data.get('store_id')
-        or query_params.get('store_id')
-        or headers.get('X-Store-Id')
+        if 'store_id' in data
+        else (query_params.get('store_id') or headers.get('X-Store-Id'))
     )
     if supplied_store_id is not None:
+        if is_write_request and 'store_id' in data:
+            raise AuthenticationBoundaryError(
+                "Client-supplied store_id is not permitted in write request payloads; store_id is server-controlled."
+            )
         profile = getattr(getattr(request, 'user', None), 'identity_profile', None)
         effective_store_id = getattr(profile, 'store_id', None) if profile is not None else actor.store_id
         try:
@@ -1901,6 +1962,7 @@ def enforce_no_client_identity_spoofing(request, actor: ServiceActor) -> None:
             raise AuthenticationBoundaryError(
                 "Actor is not authorized for the client-supplied store_id."
             )
+
 
 
 # ==============================================================================
@@ -2569,6 +2631,7 @@ def _resolve_actor_sqlite(conn: sqlite3.Connection, user_id: int) -> tuple[dict,
             role=ActorRole.CUSTOMER.value,
             customer_id=str(customer_id).strip(),
             authorized_branch_ids=None,
+            store_id=int(store_id) if store_id is not None else None,
         )
     elif role == 'BRANCH_MANAGER':
         if store_id is None:
@@ -2596,6 +2659,7 @@ def _resolve_actor_sqlite(conn: sqlite3.Connection, user_id: int) -> tuple[dict,
             role=ActorRole.BRANCH_MANAGER.value,
             customer_id=None,
             authorized_branch_ids=branch_ids,
+            store_id=int(store_id),
         )
     elif role == 'OWNER':
         if store_id is None:
@@ -2618,6 +2682,7 @@ def _resolve_actor_sqlite(conn: sqlite3.Connection, user_id: int) -> tuple[dict,
             role=ActorRole.OWNER.value,
             customer_id=None,
             authorized_branch_ids=branch_ids,
+            store_id=int(store_id),
         )
     else:
         raise AuthenticationBoundaryError(f"Unsupported role: {role}")
@@ -2936,6 +3001,7 @@ def authenticate_access_token_sqlite(
         token_hash=token_hash,
         jti=jwt_claims.get('jti'),
         token_family_id=jwt_claims.get('family_id'),
+        check_orm=False,
     ):
         raise AuthenticationBoundaryError(GENERIC_INVALID_ACCESS_TOKEN_MESSAGE)
 

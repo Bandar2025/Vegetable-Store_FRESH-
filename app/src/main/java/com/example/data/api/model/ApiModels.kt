@@ -2,6 +2,10 @@ package com.example.data.api.model
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 @Serializable
 data class CategoryDto(
@@ -52,6 +56,14 @@ data class ProductDto(
         get() = effectivePriceHalalas ?: priceHalalas
 }
 
+/**
+ * Server-authoritative checkout line-item request DTO (`POST /api/v1/orders/`).
+ *
+ * Security & Authority Invariants:
+ * - Sends ONLY `product_id` and `quantity_milli` (`1000 = 1.000 unit`).
+ * - Never sends `unit_price_halalas`, `price_halalas`, `line_total_halalas`,
+ *   `stock_quantity`, `on_hand_milli`, `customer_id`, `actor_id`, or `role`.
+ */
 @Serializable
 data class OrderItemRequest(
     @SerialName("product_id")
@@ -73,6 +85,14 @@ data class OrderItemRequest(
     )
 }
 
+/**
+ * Server-authoritative checkout request DTO (`POST /api/v1/orders/`).
+ *
+ * Security & Authority Invariants:
+ * - Sends ONLY `items`, `branch_id`, optional `fulfillment_warehouse_id`, and `idempotency_key`.
+ * - Never sends `total_halalas`, `subtotal_halalas`, `discount_halalas`, `delivery_fee_halalas`,
+ *   `customer_id`, `user_id`, `actor_id`, `role`, or `store_id`.
+ */
 @Serializable
 data class OrderRequest(
     @SerialName("items")
@@ -83,7 +103,14 @@ data class OrderRequest(
     val fulfillmentWarehouseId: Int? = null,
     @SerialName("idempotency_key")
     val idempotencyKey: String? = null
-)
+) {
+    init {
+        require(branchId >= 1) { "branch_id must be >= 1 (got $branchId)" }
+    }
+}
+
+typealias CheckoutItemRequest = OrderItemRequest
+typealias CheckoutRequest = OrderRequest
 
 @Serializable
 data class OrderItemDto(
@@ -120,6 +147,42 @@ data class OrderStatusHistoryDto(
 )
 
 @Serializable
+data class OrderStatusTransitionRequestDto(
+    @SerialName("to_status")
+    val toStatus: String,
+    @SerialName("reason")
+    val reason: String = ""
+)
+
+@Serializable
+data class CancelOrderRequestDto(
+    @SerialName("idempotency_key")
+    val idempotencyKey: String? = null,
+    @SerialName("reason")
+    val reason: String = "Order cancelled and stock restored"
+)
+
+@Serializable
+data class OrderTransitionMetadataDto(
+    @SerialName("from_status")
+    val fromStatus: String = "",
+    @SerialName("to_status")
+    val toStatus: String = "",
+    @SerialName("changed_by_actor_id")
+    val changedByActorId: String = "",
+    @SerialName("reason")
+    val reason: String = ""
+)
+
+@Serializable
+data class RestoredItemDto(
+    @SerialName("product_id")
+    val productId: Int,
+    @SerialName("quantity_milli")
+    val quantityMilli: Long
+)
+
+@Serializable
 data class OrderResponse(
     @SerialName("id")
     val id: Int,
@@ -146,8 +209,16 @@ data class OrderResponse(
     @SerialName("cancellation_restored")
     val cancellationRestored: Boolean = false,
     @SerialName("replayed")
-    val replayed: Boolean? = null
+    val replayed: Boolean? = null,
+    @SerialName("from_status")
+    val fromStatus: String? = null,
+    @SerialName("restored_items")
+    val restoredItems: List<RestoredItemDto> = emptyList(),
+    @SerialName("transition")
+    val transition: OrderTransitionMetadataDto? = null
 )
+
+typealias CheckoutResponse = OrderResponse
 
 @Serializable
 data class ApiErrorDto(
@@ -160,6 +231,67 @@ data class ApiErrorDto(
 ) {
     val resolvedMessage: String
         get() = detail?.takeIf { it.isNotBlank() } ?: message
+
+    companion object {
+        private val lenientErrorJson = Json {
+            ignoreUnknownKeys = true
+            isLenient = true
+            coerceInputValues = true
+        }
+
+        /**
+         * Parses a Django REST Framework error response payload into an [ApiErrorDto],
+         * supporting both `{"detail": "...", "code": "..."}` and field-level validation
+         * error objects such as `{"items": ["..."]}` or `{"errors": {...}}`.
+         */
+        fun parseFromErrorBody(rawBody: String?): ApiErrorDto {
+            val trimmed = rawBody?.trim().orEmpty()
+            if (trimmed.isEmpty()) {
+                return ApiErrorDto()
+            }
+            return try {
+                val parsed = lenientErrorJson.decodeFromString<ApiErrorDto>(trimmed)
+                if (parsed.resolvedMessage.isNotBlank() || parsed.code.isNotBlank()) {
+                    parsed
+                } else {
+                    extractFieldErrorsFromJsonObject(trimmed)
+                }
+            } catch (_: Exception) {
+                extractFieldErrorsFromJsonObject(trimmed)
+            }
+        }
+
+        private fun extractFieldErrorsFromJsonObject(rawJson: String): ApiErrorDto {
+            return try {
+                val jsonObj = lenientErrorJson.decodeFromString<JsonObject>(rawJson)
+                val codeVal = (jsonObj["code"] as? JsonPrimitive)?.content.orEmpty()
+                val detailVal = (jsonObj["detail"] as? JsonPrimitive)?.content
+                if (!detailVal.isNullOrBlank()) {
+                    return ApiErrorDto(code = codeVal, detail = detailVal)
+                }
+                val messages = mutableListOf<String>()
+                for ((key, element) in jsonObj) {
+                    if (key == "code") continue
+                    when (element) {
+                        is JsonPrimitive -> messages.add("$key: ${element.content}")
+                        is JsonArray -> {
+                            val joined = element.joinToString(", ") { item ->
+                                (item as? JsonPrimitive)?.content ?: item.toString()
+                            }
+                            messages.add("$key: $joined")
+                        }
+                        is JsonObject -> messages.add("$key: $element")
+                    }
+                }
+                ApiErrorDto(
+                    code = codeVal,
+                    detail = messages.joinToString("; ").ifBlank { rawJson }
+                )
+            } catch (_: Exception) {
+                ApiErrorDto(detail = rawJson)
+            }
+        }
+    }
 }
 
 /**
@@ -307,5 +439,3 @@ data class AuthMeResponseDto(
     @SerialName("authorized_branch_ids")
     val authorizedBranchIds: List<Int>? = null
 )
-
-

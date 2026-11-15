@@ -174,7 +174,7 @@ fun OrderHistoryScreen(
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "حالة الطلب الحالية: ${selectedOrder.orderStatus.arabicLabel}",
+                                text = "حالة الطلب الحالية: ${selectedOrder.displayStatusArabic}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = FreshGreenDark,
                                 fontWeight = FontWeight.Bold,
@@ -319,7 +319,7 @@ fun OrderHistoryCard(
                     border = BorderStroke(1.dp, FreshGreen.copy(alpha = 0.5f))
                 ) {
                     Text(
-                        text = order.orderStatus.arabicLabel,
+                        text = order.displayStatusArabic,
                         style = MaterialTheme.typography.labelSmall,
                         color = FreshGreenDark,
                         fontWeight = FontWeight.Bold,

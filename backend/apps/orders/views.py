@@ -27,6 +27,7 @@ from .auth import (
 from .models import AuthSessionToken, Order
 from .permissions import (
     IsAuthenticatedActiveProfile,
+    IsCustomerPermission,
     OrderObjectPermission,
     get_or_resolve_request_actor,
 )
@@ -39,6 +40,7 @@ from .serializers import (
     CheckoutRequestSerializer,
     OrderSerializer,
     OrderStatusTransitionRequestSerializer,
+)
 from .services import (
     ActorRole,
     AuthenticationBoundaryError,
@@ -311,6 +313,16 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = OrderSerializer
     permission_classes = [IsAuthenticated, IsAuthenticatedActiveProfile, OrderObjectPermission]
 
+    def get_permissions(self):
+        if getattr(self, 'action', None) in ('create', 'checkout'):
+            return [
+                IsAuthenticated(),
+                IsAuthenticatedActiveProfile(),
+                IsCustomerPermission(),
+                OrderObjectPermission(),
+            ]
+        return [permission() for permission in self.permission_classes]
+
     def _base_order_queryset(self):
         return (
             Order.objects.select_related('branch', 'fulfillment_warehouse')
@@ -511,7 +523,11 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         req_serializer.is_valid(raise_exception=True)
         validated = req_serializer.validated_data
 
-        idempotency_key = _extract_idempotency_key(request, validated)
+        try:
+            idempotency_key = _extract_idempotency_key(request, validated)
+        except IdempotencyConflictError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
+
         if not idempotency_key:
             return Response(
                 {'detail': 'idempotency_key is required (in body or Idempotency-Key header).'},

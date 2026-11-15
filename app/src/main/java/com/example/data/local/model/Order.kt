@@ -63,18 +63,74 @@ enum class OrderStatus(
         return target in allowedNextStatuses()
     }
 
+    fun toServerStatusString(): String = when (this) {
+        CONFIRMED_LOCAL -> "CONFIRMED"
+        PREPARING -> "PROCESSING"
+        OUT_FOR_DELIVERY -> "OUT_FOR_DELIVERY"
+        DELIVERED -> "COMPLETED"
+        CANCELLED -> "CANCELLED"
+    }
+
     companion object {
         val CREATED: OrderStatus = CONFIRMED_LOCAL
         val CONFIRMED: OrderStatus = CONFIRMED_LOCAL
+        val PENDING: OrderStatus = CONFIRMED_LOCAL
         val PROCESSING: OrderStatus = PREPARING
         val COMPLETED: OrderStatus = DELIVERED
 
+        val SERVER_STATUS_CODES: Set<String> = setOf(
+            "PENDING",
+            "CONFIRMED",
+            "PROCESSING",
+            "COMPLETED",
+            "CANCELLED"
+        )
+
+        fun allowedNextServerStatuses(rawServerStatus: String): Set<String> {
+            return when (rawServerStatus.trim().uppercase(Locale.US)) {
+                "PENDING" -> setOf("CONFIRMED", "CANCELLED")
+                "CONFIRMED" -> setOf("PROCESSING", "CANCELLED")
+                "PROCESSING" -> setOf("COMPLETED", "CANCELLED")
+                "COMPLETED", "CANCELLED" -> emptySet()
+                else -> emptySet()
+            }
+        }
+
+        fun serverStatusArabicLabel(rawServerStatus: String): String {
+            return when (rawServerStatus.trim().uppercase(Locale.US)) {
+                "PENDING" -> "قيد الانتظار (PENDING)"
+                "CONFIRMED" -> "تم تأكيد الطلب (CONFIRMED)"
+                "PROCESSING" -> "قيد التجهيز (PROCESSING)"
+                "COMPLETED" -> "مكتمل (COMPLETED)"
+                "CANCELLED" -> "ملغي (CANCELLED)"
+                else -> fromNameOrDefault(rawServerStatus).arabicLabel
+            }
+        }
+
+        fun serverActionButtonArabic(targetServerStatus: String): String {
+            return when (targetServerStatus.trim().uppercase(Locale.US)) {
+                "CONFIRMED" -> "تأكيد الطلب (CONFIRMED)"
+                "PROCESSING" -> "بدء تجهيز الطلب (PROCESSING)"
+                "COMPLETED" -> "إكمال الطلب وتسليمه (COMPLETED)"
+                "CANCELLED" -> "إلغاء الطلب واسترجاع المخزون"
+                else -> fromNameOrDefault(targetServerStatus).actionButtonArabic
+            }
+        }
+
         fun fromNameOrDefault(raw: String): OrderStatus {
-            return entries.find { it.name.equals(raw.trim(), ignoreCase = true) } ?: CONFIRMED_LOCAL
+            return fromNameOrNull(raw) ?: CONFIRMED_LOCAL
         }
 
         fun fromNameOrNull(raw: String): OrderStatus? {
-            return entries.find { it.name.equals(raw.trim(), ignoreCase = true) }
+            val cleaned = raw.trim().uppercase(Locale.US)
+            return when (cleaned) {
+                "PENDING", "CONFIRMED", "CONFIRMED_LOCAL" -> CONFIRMED_LOCAL
+                "PROCESSING", "PREPARING" -> PREPARING
+                "OUT_FOR_DELIVERY" -> OUT_FOR_DELIVERY
+                "COMPLETED", "DELIVERED" -> DELIVERED
+                "CANCELLED" -> CANCELLED
+                else -> entries.find { it.name.equals(cleaned, ignoreCase = true) }
+            }
         }
     }
 }
@@ -197,6 +253,45 @@ data class Order(
 
     val orderStatus: OrderStatus
         get() = OrderStatus.fromNameOrDefault(status)
+
+    val isServerBacked: Boolean
+        get() {
+            val normalized = status.trim().uppercase(Locale.US)
+            return paymentModeNote.contains("الخادم") ||
+                normalized in setOf("PENDING", "CONFIRMED", "PROCESSING", "COMPLETED")
+        }
+
+    val displayStatusArabic: String
+        get() = if (isServerBacked) {
+            OrderStatus.serverStatusArabicLabel(status)
+        } else {
+            orderStatus.arabicLabel
+        }
+
+    val canOrderBeCancelled: Boolean
+        get() = if (isServerBacked) {
+            status.trim().uppercase(Locale.US) in setOf("PENDING", "CONFIRMED", "PROCESSING")
+        } else {
+            orderStatus.canBeCancelled
+        }
+
+    fun allowedNextOrderStatuses(): Set<OrderStatus> {
+        return if (isServerBacked) {
+            when (status.trim().uppercase(Locale.US)) {
+                "PENDING" -> setOf(OrderStatus.CONFIRMED_LOCAL, OrderStatus.CANCELLED)
+                "CONFIRMED" -> setOf(OrderStatus.PREPARING, OrderStatus.CANCELLED)
+                "PROCESSING" -> setOf(OrderStatus.DELIVERED, OrderStatus.CANCELLED)
+                "COMPLETED", "CANCELLED" -> emptySet()
+                else -> emptySet()
+            }
+        } else {
+            orderStatus.allowedNextStatuses()
+        }
+    }
+
+    fun allowedNextServerStatuses(): Set<String> {
+        return OrderStatus.allowedNextServerStatuses(status)
+    }
 
     fun formattedSubtotalSar(): String = CurrencyCalculator.formatHalalasToSar(subtotalHalalas.toLong())
 

@@ -1,10 +1,13 @@
 """
 Atomic Backend Checkout, Order Status Lifecycle, and Single-Execution Order Cancellation Services.
 
-Authentication Boundary Notice:
-- The project does not yet have verified production authentication or public RBAC middleware.
-- These services MUST NOT be exposed as unauthenticated public HTTP endpoints.
-- Callers must supply an explicit `ServiceActor` representing the authenticated/verified actor context.
+Authentication & Authorization Architecture:
+- All HTTP order endpoints (`OrderViewSet`) enforce `SessionTokenAuthentication` (signed HS256 JWT + allowlist/blocklist),
+  `IsAuthenticated`, `IsAuthenticatedActiveProfile`, `IsCustomerPermission` (on `create` / `checkout`),
+  and `OrderObjectPermission`.
+- Request actors (`ServiceActor`) are resolved strictly from the authenticated user's active
+  `UserIdentityProfile` via `get_or_resolve_request_actor` and protected against client identity,
+  role, or tenant spoofing via `enforce_no_client_identity_spoofing`.
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ from enum import Enum
 import hashlib
 import json
 import sqlite3
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
+import uuid
 
 try:
     from django.core.exceptions import ValidationError as DjangoValidationError
@@ -351,11 +355,24 @@ FORBIDDEN_ORDER_CHECKOUT_FIELDS = frozenset({
     'total',
     'discount_halalas',
     'delivery_fee_halalas',
+    'effective_price_halalas',
+    'override_price_halalas',
+    'unit_price_halalas',
+    'price_halalas',
+    'line_total_halalas',
+    'expected_unit_price_halalas',
+    'stock_quantity',
+    'on_hand_milli',
+    'reserved_milli',
+    'available_milli',
+    'stock_milli',
+    'balance_after_milli',
 })
 
 FORBIDDEN_ITEM_FIELDS = frozenset({
     'effective_price_halalas',
     'override_price_halalas',
+    'price_halalas',
     'stock_quantity',
     'on_hand_milli',
     'reserved_milli',
@@ -370,6 +387,17 @@ FORBIDDEN_ITEM_FIELDS = frozenset({
     'subtotal',
     'subtotal_halalas',
     'discount_halalas',
+    'delivery_fee_halalas',
+    'total_halalas',
+    'expected_total_halalas',
+    'customer_id',
+    'user_id',
+    'actor_id',
+    'role',
+    'actor_role',
+    'store_id',
+    'branch_id',
+    'branch',
 })
 
 
@@ -407,7 +435,7 @@ def _normalize_checkout_items(
                     )
             product_id = raw_item.get('product_id', raw_item.get('product'))
             quantity_milli = raw_item.get('quantity_milli')
-            client_unit_price = raw_item.get('unit_price_halalas', raw_item.get('price_halalas'))
+            client_unit_price = raw_item.get('unit_price_halalas')
             client_line_total = raw_item.get('line_total_halalas')
             expected_unit_price = raw_item.get('expected_unit_price_halalas')
         else:
@@ -590,6 +618,7 @@ def checkout_order(
     reject_client_pricing: bool = False,
     sqlite_conn: sqlite3.Connection | None = None,
     conn: sqlite3.Connection | None = None,
+    _on_before_order_insert_hook: Callable[[], None] | None = None,
 ) -> CheckoutResult:
     """
     Executes an atomic, server-authoritative multi-branch order checkout.
@@ -675,6 +704,7 @@ def checkout_order(
             client_total_halalas=validated_client_total,
             expected_total_halalas=validated_expected_total,
             reject_client_pricing=reject_client_pricing,
+            _on_before_order_insert_hook=_on_before_order_insert_hook,
         )
 
     if not DJANGO_ORM_AVAILABLE:
@@ -693,6 +723,7 @@ def checkout_order(
         client_total_halalas=validated_client_total,
         expected_total_halalas=validated_expected_total,
         reject_client_pricing=reject_client_pricing,
+        _on_before_order_insert_hook=_on_before_order_insert_hook,
     )
 
 
@@ -708,6 +739,7 @@ def _checkout_order_django(
     client_total_halalas: int | None = None,
     expected_total_halalas: int | None = None,
     reject_client_pricing: bool = False,
+    _on_before_order_insert_hook: Callable[[], None] | None = None,
 ) -> CheckoutResult:
     try:
         with transaction.atomic():
@@ -729,12 +761,21 @@ def _checkout_order_django(
                 if existing_idem.response_payload:
                     return _deserialize_checkout_result(existing_idem.response_payload, replayed=True)
 
-            if Order.objects.select_for_update().filter(
-                customer_id=customer_id,
-                idempotency_key=idempotency_key,
-            ).exists():
-                raise IdempotencyConflictError(
-                    f"Idempotency key '{idempotency_key}' is already claimed by another order for customer '{customer_id}'."
+            existing_order = (
+                Order.objects.select_for_update()
+                .filter(
+                    customer_id=customer_id,
+                    idempotency_key=idempotency_key,
+                )
+                .first()
+            )
+            if existing_order is not None:
+                return _reconstruct_or_conflict_existing_order_django(
+                    existing_order=existing_order,
+                    branch_id=branch_id,
+                    fulfillment_warehouse_id=fulfillment_warehouse_id,
+                    items=items,
+                    idempotency_key=idempotency_key,
                 )
 
             # 2. Validate user store scope, branch, and fulfillment warehouse
@@ -903,6 +944,9 @@ def _checkout_order_django(
                 )
 
             # 8. Create Order
+            if _on_before_order_insert_hook is not None:
+                _on_before_order_insert_hook()
+
             order = Order.objects.create(
                 branch=branch,
                 fulfillment_warehouse=warehouse,
@@ -1017,11 +1061,144 @@ def _checkout_order_django(
                 ) from exc
             if concurrent_idem.response_payload:
                 return _deserialize_checkout_result(concurrent_idem.response_payload, replayed=True)
-        if Order.objects.filter(customer_id=customer_id, idempotency_key=idempotency_key).exists():
-            raise IdempotencyConflictError(
-                f"Idempotency key '{idempotency_key}' is already claimed by another order for customer '{customer_id}'."
-            ) from exc
+        existing_order = Order.objects.filter(
+            customer_id=customer_id,
+            idempotency_key=idempotency_key,
+        ).first()
+        if existing_order is not None:
+            return _reconstruct_or_conflict_existing_order_django(
+                existing_order=existing_order,
+                branch_id=branch_id,
+                fulfillment_warehouse_id=fulfillment_warehouse_id,
+                items=items,
+                idempotency_key=idempotency_key,
+            )
         raise
+
+
+def _reconstruct_or_conflict_existing_order_django(
+    *,
+    existing_order: Any,
+    branch_id: int,
+    fulfillment_warehouse_id: int | None,
+    items: list[CheckoutItemInput],
+    idempotency_key: str,
+) -> CheckoutResult:
+    if int(existing_order.branch_id) != int(branch_id):
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' was already used for branch {existing_order.branch_id} (requested branch {branch_id})."
+        )
+    if (
+        fulfillment_warehouse_id is not None
+        and existing_order.fulfillment_warehouse_id is not None
+        and int(existing_order.fulfillment_warehouse_id) != int(fulfillment_warehouse_id)
+    ):
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' was already used for warehouse {existing_order.fulfillment_warehouse_id} (requested warehouse {fulfillment_warehouse_id})."
+        )
+    order_items = list(existing_order.items.all().order_by('product_id', 'id'))
+    existing_pairs = [(int(oi.product_id), int(oi.quantity_milli)) for oi in order_items]
+    requested_pairs = sorted((int(i.product_id), int(i.quantity_milli)) for i in items)
+    if existing_pairs != requested_pairs:
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' was already used with a different checkout request payload."
+        )
+    snapshot_items = tuple(
+        OrderItemSnapshotResult(
+            id=int(oi.id),
+            product_id=int(oi.product_id),
+            product_name_snapshot=str(oi.product_name_snapshot),
+            unit_snapshot=str(oi.unit_snapshot),
+            quantity_milli=int(oi.quantity_milli),
+            unit_price_halalas=int(oi.unit_price_halalas),
+            line_total_halalas=int(oi.line_total_halalas),
+        )
+        for oi in order_items
+    )
+    return CheckoutResult(
+        order_id=int(existing_order.id),
+        branch_id=int(existing_order.branch_id),
+        fulfillment_warehouse_id=int(existing_order.fulfillment_warehouse_id or 0),
+        customer_id=str(existing_order.customer_id),
+        status=str(existing_order.status),
+        total_halalas=int(existing_order.total_halalas),
+        idempotency_key=str(existing_order.idempotency_key or idempotency_key),
+        items=snapshot_items,
+        replayed=True,
+    )
+
+
+def _reconstruct_or_conflict_existing_order_sqlite(
+    conn: sqlite3.Connection,
+    *,
+    existing_order_id: int,
+    customer_id: str,
+    branch_id: int,
+    fulfillment_warehouse_id: int | None,
+    items: list[CheckoutItemInput],
+    idempotency_key: str,
+) -> CheckoutResult:
+    order_row = conn.execute(
+        """
+        SELECT id, branch_id, fulfillment_warehouse_id, customer_id, status, total_halalas, idempotency_key
+        FROM orders_order
+        WHERE id = ? AND customer_id = ?
+        """,
+        (existing_order_id, customer_id),
+    ).fetchone()
+    if order_row is None:
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' is already claimed by another order for customer '{customer_id}'."
+        )
+    o_id, o_branch_id, o_wh_id, o_cust_id, o_status, o_total_halalas, o_idem = order_row
+    if int(o_branch_id) != int(branch_id):
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' was already used for branch {o_branch_id} (requested branch {branch_id})."
+        )
+    if fulfillment_warehouse_id is not None and o_wh_id is not None and int(o_wh_id) != int(fulfillment_warehouse_id):
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' was already used for warehouse {o_wh_id} (requested warehouse {fulfillment_warehouse_id})."
+        )
+
+    item_rows = conn.execute(
+        """
+        SELECT id, product_id, product_name_snapshot, unit_snapshot, quantity_milli, unit_price_halalas, line_total_halalas
+        FROM orders_orderitem
+        WHERE order_id = ?
+        ORDER BY product_id ASC, id ASC
+        """,
+        (int(o_id),),
+    ).fetchall()
+    existing_pairs = [(int(r[1]), int(r[4])) for r in item_rows]
+    requested_pairs = sorted((int(i.product_id), int(i.quantity_milli)) for i in items)
+    if existing_pairs != requested_pairs:
+        raise IdempotencyConflictError(
+            f"Idempotency key '{idempotency_key}' was already used with a different checkout request payload."
+        )
+
+    snapshot_items = tuple(
+        OrderItemSnapshotResult(
+            id=int(r[0]),
+            product_id=int(r[1]),
+            product_name_snapshot=str(r[2]),
+            unit_snapshot=str(r[3]),
+            quantity_milli=int(r[4]),
+            unit_price_halalas=int(r[5]),
+            line_total_halalas=int(r[6]),
+        )
+        for r in item_rows
+    )
+    return CheckoutResult(
+        order_id=int(o_id),
+        branch_id=int(o_branch_id),
+        fulfillment_warehouse_id=int(o_wh_id) if o_wh_id is not None else 0,
+        customer_id=str(o_cust_id),
+        status=str(o_status),
+        total_halalas=int(o_total_halalas),
+        idempotency_key=str(o_idem or idempotency_key),
+        items=snapshot_items,
+        replayed=True,
+    )
 
 
 def _checkout_order_sqlite(
@@ -1037,228 +1214,239 @@ def _checkout_order_sqlite(
     client_total_halalas: int | None = None,
     expected_total_halalas: int | None = None,
     reject_client_pricing: bool = False,
+    _on_before_order_insert_hook: Callable[[], None] | None = None,
 ) -> CheckoutResult:
     conn.execute('PRAGMA foreign_keys = ON;')
-    savepoint_name = 'sp_checkout_order'
+
+    # 1. Check IdempotencyKey
+    idem_row = conn.execute(
+        """
+        SELECT request_hash, response_payload
+        FROM orders_idempotencykey
+        WHERE actor_id = ? AND operation = ? AND idempotency_key = ?
+        """,
+        (actor.actor_id, OPERATION_CHECKOUT_ORDER, idempotency_key),
+    ).fetchone()
+
+    if idem_row is not None:
+        stored_hash, stored_payload_json = idem_row
+        if stored_hash != request_hash:
+            raise IdempotencyConflictError(
+                f"Idempotency key '{idempotency_key}' was already used with a different checkout request payload."
+            )
+        payload = json.loads(stored_payload_json)
+        return _deserialize_checkout_result(payload, replayed=True)
+
+    existing_order_with_key = conn.execute(
+        "SELECT id FROM orders_order WHERE customer_id = ? AND idempotency_key = ?",
+        (customer_id, idempotency_key),
+    ).fetchone()
+    if existing_order_with_key is not None:
+        return _reconstruct_or_conflict_existing_order_sqlite(
+            conn,
+            existing_order_id=int(existing_order_with_key[0]),
+            customer_id=customer_id,
+            branch_id=branch_id,
+            fulfillment_warehouse_id=fulfillment_warehouse_id,
+            items=items,
+            idempotency_key=idempotency_key,
+        )
+
+    # 2. Validate user store scope, branch, and fulfillment warehouse
+    branch_row = conn.execute(
+        """
+        SELECT b.id, b.store_id, b.code, b.is_active, s.is_active
+        FROM products_branch b
+        JOIN products_store s ON s.id = b.store_id
+        WHERE b.id = ?
+        """,
+        (branch_id,),
+    ).fetchone()
+    if branch_row is None:
+        raise CheckoutResourceNotFoundError(f"Branch {branch_id} does not exist.")
+    b_id, b_store_id, b_code, b_active, s_active = branch_row
+    if actor.store_id is not None and int(b_store_id) != int(actor.store_id):
+        raise AuthenticationBoundaryError(
+            f"Actor '{actor.actor_id}' is not authorized to access branch {b_id} in store {b_store_id}."
+        )
+    if not bool(b_active) or not bool(s_active):
+        raise CheckoutValidationError(f"Branch {b_code} or its store is inactive.")
+
+    if fulfillment_warehouse_id is not None:
+        wh_row = conn.execute(
+            """
+            SELECT w.id, w.branch_id, b.store_id, w.code, w.is_active
+            FROM products_warehouse w
+            JOIN products_branch b ON b.id = w.branch_id
+            WHERE w.id = ?
+            """,
+            (fulfillment_warehouse_id,),
+        ).fetchone()
+        if wh_row is None:
+            raise BranchWarehouseMismatchError(f"Warehouse {fulfillment_warehouse_id} does not exist.")
+        wh_id, wh_branch_id, wh_store_id, wh_code, wh_active = wh_row
+        if int(wh_branch_id) != int(b_id) or int(wh_store_id) != int(b_store_id):
+            raise BranchWarehouseMismatchError(
+                f"Warehouse {wh_code} (branch_id={wh_branch_id}) does not belong to branch {b_code} (id={b_id})."
+            )
+        if not bool(wh_active):
+            raise CheckoutValidationError(f"Warehouse {wh_code} is inactive.")
+    else:
+        wh_row = conn.execute(
+            """
+            SELECT id, branch_id, code, is_active
+            FROM products_warehouse
+            WHERE branch_id = ? AND is_primary_fulfillment = 1 AND is_active = 1
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (b_id,),
+        ).fetchone()
+        if wh_row is None:
+            raise BranchWarehouseMismatchError(
+                f"No active primary fulfillment warehouse exists for branch {b_code}."
+            )
+        wh_id, wh_branch_id, wh_code, wh_active = wh_row
+
+    items_by_product_id = {item.product_id: item for item in items}
+    sorted_product_ids = sorted(items_by_product_id.keys())
+
+    # 3, 4, 5, 6, & 7. Load products, lock/check balances in deterministic product_id order, and compute prices
+    prepared_lines: list[dict[str, Any]] = []
+    for pid in sorted_product_ids:
+        req_item = items_by_product_id[pid]
+        prod_row = conn.execute(
+            """
+            SELECT id, sku, name, price_halalas, unit, is_fractional_allowed, is_active
+            FROM products_product
+            WHERE id = ?
+            """,
+            (pid,),
+        ).fetchone()
+        if prod_row is None:
+            raise CheckoutResourceNotFoundError(f"Product {pid} does not exist.")
+        p_id, p_sku, p_name, p_price_halalas, p_unit, p_frac_allowed, p_active = prod_row
+        if not bool(p_active):
+            raise CheckoutValidationError(f"Product '{p_sku}' is inactive.")
+
+        ov_row = conn.execute(
+            """
+            SELECT override_price_halalas, is_available, min_order_quantity_milli, max_order_quantity_milli
+            FROM products_branchproductoverride
+            WHERE branch_id = ? AND product_id = ?
+            """,
+            (b_id, p_id),
+        ).fetchone()
+        override_price = None
+        min_qty = 1
+        max_qty = None
+        if ov_row is not None:
+            override_price, ov_available, min_qty, max_qty = ov_row
+            if not bool(ov_available):
+                raise CheckoutValidationError(
+                    f"Product '{p_sku}' is marked unavailable in branch '{b_code}'."
+                )
+
+        try:
+            validate_milli_quantity(
+                req_item.quantity_milli,
+                is_fractional_allowed=bool(p_frac_allowed),
+                min_order_quantity_milli=int(min_qty) if min_qty is not None else 1,
+                max_order_quantity_milli=int(max_qty) if max_qty is not None else None,
+            )
+        except ValueError as exc:
+            raise CheckoutValidationError(str(exc)) from exc
+
+        bal_row = conn.execute(
+            """
+            SELECT id, on_hand_milli, reserved_milli, version
+            FROM products_warehousestockbalance
+            WHERE warehouse_id = ? AND product_id = ?
+            """,
+            (wh_id, p_id),
+        ).fetchone()
+        if bal_row is None:
+            raise MissingStockBalanceError(
+                f"Missing WarehouseStockBalance for product '{p_sku}' (id={p_id}) in warehouse '{wh_code}'."
+            )
+        bal_id, on_hand_milli, reserved_milli, bal_version = bal_row
+        available_milli = int(on_hand_milli) - int(reserved_milli)
+        if available_milli < req_item.quantity_milli or (int(on_hand_milli) - req_item.quantity_milli) < 0:
+            raise InsufficientStockError(
+                f"Insufficient available stock for product '{p_sku}': "
+                f"requested={req_item.quantity_milli} milli-units, available={available_milli} milli-units."
+            )
+
+        unit_price_halalas = resolve_effective_price_halalas(
+            int(p_price_halalas),
+            int(override_price) if override_price is not None else None,
+        )
+        if (
+            req_item.expected_unit_price_halalas is not None
+            and req_item.expected_unit_price_halalas != unit_price_halalas
+        ):
+            raise SpoofedFinancialDataError(
+                f"Expected unit price ({req_item.expected_unit_price_halalas} halalas) for product '{p_sku}' "
+                f"does not match authoritative server price ({unit_price_halalas} halalas)."
+            )
+        if (
+            reject_client_pricing
+            and req_item.client_unit_price_halalas is not None
+            and req_item.client_unit_price_halalas != unit_price_halalas
+        ):
+            raise SpoofedFinancialDataError(
+                f"Client-supplied unit_price_halalas ({req_item.client_unit_price_halalas}) for product '{p_sku}' "
+                f"does not match authoritative server price ({unit_price_halalas} halalas)."
+            )
+
+        line_total_halalas = calculate_line_total_halalas(
+            req_item.quantity_milli,
+            unit_price_halalas,
+        )
+        if (
+            reject_client_pricing
+            and req_item.client_line_total_halalas is not None
+            and req_item.client_line_total_halalas != line_total_halalas
+        ):
+            raise SpoofedFinancialDataError(
+                f"Client-supplied line_total_halalas ({req_item.client_line_total_halalas}) for product '{p_sku}' "
+                f"does not match authoritative server line total ({line_total_halalas} halalas)."
+            )
+
+        prepared_lines.append(
+            {
+                'product_id': int(p_id),
+                'product_sku': str(p_sku),
+                'product_name_snapshot': str(p_name),
+                'unit_snapshot': str(p_unit),
+                'quantity_milli': req_item.quantity_milli,
+                'unit_price_halalas': unit_price_halalas,
+                'line_total_halalas': line_total_halalas,
+                'balance_id': int(bal_id),
+                'on_hand_milli': int(on_hand_milli),
+                'reserved_milli': int(reserved_milli),
+                'version': int(bal_version),
+            }
+        )
+
+    authoritative_total_halalas = calculate_order_total_halalas(
+        [line['line_total_halalas'] for line in prepared_lines]
+    )
+    if expected_total_halalas is not None and expected_total_halalas != authoritative_total_halalas:
+        raise SpoofedFinancialDataError(
+            f"Expected order total ({expected_total_halalas} halalas) does not match authoritative server total ({authoritative_total_halalas} halalas)."
+        )
+    if reject_client_pricing and client_total_halalas is not None and client_total_halalas != authoritative_total_halalas:
+        raise SpoofedFinancialDataError(
+            f"Client-supplied total_halalas ({client_total_halalas}) does not match authoritative server total ({authoritative_total_halalas} halalas)."
+        )
+
+    if _on_before_order_insert_hook is not None:
+        _on_before_order_insert_hook()
+
+    savepoint_name = f"sp_checkout_{uuid.uuid4().hex[:12]}"
     conn.execute(f'SAVEPOINT {savepoint_name};')
     try:
-        # 1. Check IdempotencyKey
-        idem_row = conn.execute(
-            """
-            SELECT request_hash, response_payload
-            FROM orders_idempotencykey
-            WHERE actor_id = ? AND operation = ? AND idempotency_key = ?
-            """,
-            (actor.actor_id, OPERATION_CHECKOUT_ORDER, idempotency_key),
-        ).fetchone()
-
-        if idem_row is not None:
-            stored_hash, stored_payload_json = idem_row
-            if stored_hash != request_hash:
-                raise IdempotencyConflictError(
-                    f"Idempotency key '{idempotency_key}' was already used with a different checkout request payload."
-                )
-            payload = json.loads(stored_payload_json)
-            conn.execute(f'RELEASE SAVEPOINT {savepoint_name};')
-            return _deserialize_checkout_result(payload, replayed=True)
-
-        existing_order_with_key = conn.execute(
-            "SELECT id FROM orders_order WHERE customer_id = ? AND idempotency_key = ?",
-            (customer_id, idempotency_key),
-        ).fetchone()
-        if existing_order_with_key is not None:
-            raise IdempotencyConflictError(
-                f"Idempotency key '{idempotency_key}' is already claimed by another order for customer '{customer_id}'."
-            )
-
-        # 2. Validate user store scope, branch, and fulfillment warehouse
-        branch_row = conn.execute(
-            """
-            SELECT b.id, b.store_id, b.code, b.is_active, s.is_active
-            FROM products_branch b
-            JOIN products_store s ON s.id = b.store_id
-            WHERE b.id = ?
-            """,
-            (branch_id,),
-        ).fetchone()
-        if branch_row is None:
-            raise CheckoutResourceNotFoundError(f"Branch {branch_id} does not exist.")
-        b_id, b_store_id, b_code, b_active, s_active = branch_row
-        if actor.store_id is not None and int(b_store_id) != int(actor.store_id):
-            raise AuthenticationBoundaryError(
-                f"Actor '{actor.actor_id}' is not authorized to access branch {b_id} in store {b_store_id}."
-            )
-        if not bool(b_active) or not bool(s_active):
-            raise CheckoutValidationError(f"Branch {b_code} or its store is inactive.")
-
-        if fulfillment_warehouse_id is not None:
-            wh_row = conn.execute(
-                """
-                SELECT w.id, w.branch_id, b.store_id, w.code, w.is_active
-                FROM products_warehouse w
-                JOIN products_branch b ON b.id = w.branch_id
-                WHERE w.id = ?
-                """,
-                (fulfillment_warehouse_id,),
-            ).fetchone()
-            if wh_row is None:
-                raise BranchWarehouseMismatchError(f"Warehouse {fulfillment_warehouse_id} does not exist.")
-            wh_id, wh_branch_id, wh_store_id, wh_code, wh_active = wh_row
-            if int(wh_branch_id) != int(b_id) or int(wh_store_id) != int(b_store_id):
-                raise BranchWarehouseMismatchError(
-                    f"Warehouse {wh_code} (branch_id={wh_branch_id}) does not belong to branch {b_code} (id={b_id})."
-                )
-            if not bool(wh_active):
-                raise CheckoutValidationError(f"Warehouse {wh_code} is inactive.")
-        else:
-            wh_row = conn.execute(
-                """
-                SELECT id, branch_id, code, is_active
-                FROM products_warehouse
-                WHERE branch_id = ? AND is_primary_fulfillment = 1 AND is_active = 1
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (b_id,),
-            ).fetchone()
-            if wh_row is None:
-                raise BranchWarehouseMismatchError(
-                    f"No active primary fulfillment warehouse exists for branch {b_code}."
-                )
-            wh_id, wh_branch_id, wh_code, wh_active = wh_row
-
-        items_by_product_id = {item.product_id: item for item in items}
-        sorted_product_ids = sorted(items_by_product_id.keys())
-
-        # 3, 4, 5, 6, & 7. Load products, lock/check balances in deterministic product_id order, and compute prices
-        prepared_lines: list[dict[str, Any]] = []
-        for pid in sorted_product_ids:
-            req_item = items_by_product_id[pid]
-            prod_row = conn.execute(
-                """
-                SELECT id, sku, name, price_halalas, unit, is_fractional_allowed, is_active
-                FROM products_product
-                WHERE id = ?
-                """,
-                (pid,),
-            ).fetchone()
-            if prod_row is None:
-                raise CheckoutResourceNotFoundError(f"Product {pid} does not exist.")
-            p_id, p_sku, p_name, p_price_halalas, p_unit, p_frac_allowed, p_active = prod_row
-            if not bool(p_active):
-                raise CheckoutValidationError(f"Product '{p_sku}' is inactive.")
-
-            ov_row = conn.execute(
-                """
-                SELECT override_price_halalas, is_available, min_order_quantity_milli, max_order_quantity_milli
-                FROM products_branchproductoverride
-                WHERE branch_id = ? AND product_id = ?
-                """,
-                (b_id, p_id),
-            ).fetchone()
-            override_price = None
-            min_qty = 1
-            max_qty = None
-            if ov_row is not None:
-                override_price, ov_available, min_qty, max_qty = ov_row
-                if not bool(ov_available):
-                    raise CheckoutValidationError(
-                        f"Product '{p_sku}' is marked unavailable in branch '{b_code}'."
-                    )
-
-            try:
-                validate_milli_quantity(
-                    req_item.quantity_milli,
-                    is_fractional_allowed=bool(p_frac_allowed),
-                    min_order_quantity_milli=int(min_qty) if min_qty is not None else 1,
-                    max_order_quantity_milli=int(max_qty) if max_qty is not None else None,
-                )
-            except ValueError as exc:
-                raise CheckoutValidationError(str(exc)) from exc
-
-            bal_row = conn.execute(
-                """
-                SELECT id, on_hand_milli, reserved_milli, version
-                FROM products_warehousestockbalance
-                WHERE warehouse_id = ? AND product_id = ?
-                """,
-                (wh_id, p_id),
-            ).fetchone()
-            if bal_row is None:
-                raise MissingStockBalanceError(
-                    f"Missing WarehouseStockBalance for product '{p_sku}' (id={p_id}) in warehouse '{wh_code}'."
-                )
-            bal_id, on_hand_milli, reserved_milli, bal_version = bal_row
-            available_milli = int(on_hand_milli) - int(reserved_milli)
-            if available_milli < req_item.quantity_milli or (int(on_hand_milli) - req_item.quantity_milli) < 0:
-                raise InsufficientStockError(
-                    f"Insufficient available stock for product '{p_sku}': "
-                    f"requested={req_item.quantity_milli} milli-units, available={available_milli} milli-units."
-                )
-
-            unit_price_halalas = resolve_effective_price_halalas(
-                int(p_price_halalas),
-                int(override_price) if override_price is not None else None,
-            )
-            if (
-                req_item.expected_unit_price_halalas is not None
-                and req_item.expected_unit_price_halalas != unit_price_halalas
-            ):
-                raise SpoofedFinancialDataError(
-                    f"Expected unit price ({req_item.expected_unit_price_halalas} halalas) for product '{p_sku}' "
-                    f"does not match authoritative server price ({unit_price_halalas} halalas)."
-                )
-            if (
-                reject_client_pricing
-                and req_item.client_unit_price_halalas is not None
-                and req_item.client_unit_price_halalas != unit_price_halalas
-            ):
-                raise SpoofedFinancialDataError(
-                    f"Client-supplied unit_price_halalas ({req_item.client_unit_price_halalas}) for product '{p_sku}' "
-                    f"does not match authoritative server price ({unit_price_halalas} halalas)."
-                )
-
-            line_total_halalas = calculate_line_total_halalas(
-                req_item.quantity_milli,
-                unit_price_halalas,
-            )
-            if (
-                reject_client_pricing
-                and req_item.client_line_total_halalas is not None
-                and req_item.client_line_total_halalas != line_total_halalas
-            ):
-                raise SpoofedFinancialDataError(
-                    f"Client-supplied line_total_halalas ({req_item.client_line_total_halalas}) for product '{p_sku}' "
-                    f"does not match authoritative server line total ({line_total_halalas} halalas)."
-                )
-
-            prepared_lines.append(
-                {
-                    'product_id': int(p_id),
-                    'product_name_snapshot': str(p_name),
-                    'unit_snapshot': str(p_unit),
-                    'quantity_milli': req_item.quantity_milli,
-                    'unit_price_halalas': unit_price_halalas,
-                    'line_total_halalas': line_total_halalas,
-                    'balance_id': int(bal_id),
-                    'on_hand_milli': int(on_hand_milli),
-                    'reserved_milli': int(reserved_milli),
-                    'version': int(bal_version),
-                }
-            )
-
-        authoritative_total_halalas = calculate_order_total_halalas(
-            [line['line_total_halalas'] for line in prepared_lines]
-        )
-        if expected_total_halalas is not None and expected_total_halalas != authoritative_total_halalas:
-            raise SpoofedFinancialDataError(
-                f"Expected order total ({expected_total_halalas} halalas) does not match authoritative server total ({authoritative_total_halalas} halalas)."
-            )
-        if reject_client_pricing and client_total_halalas is not None and client_total_halalas != authoritative_total_halalas:
-            raise SpoofedFinancialDataError(
-                f"Client-supplied total_halalas ({client_total_halalas}) does not match authoritative server total ({authoritative_total_halalas} halalas)."
-            )
-
         # 8. Create Order
         cursor = conn.execute(
             """
@@ -1280,6 +1468,17 @@ def _checkout_order_sqlite(
         # 9, 10, & 11. Create OrderItem snapshots, deduct stock, and record StockMovement
         snapshot_results: list[OrderItemSnapshotResult] = []
         for line in prepared_lines:
+            # Refresh current balance inside write savepoint to prevent stale reads if a hook ran
+            cur_bal = conn.execute(
+                "SELECT on_hand_milli, reserved_milli, version FROM products_warehousestockbalance WHERE id = ?",
+                (line['balance_id'],),
+            ).fetchone()
+            cur_on_hand, cur_reserved, cur_version = (
+                (int(cur_bal[0]), int(cur_bal[1]), int(cur_bal[2]))
+                if cur_bal is not None
+                else (line['on_hand_milli'], line['reserved_milli'], line['version'])
+            )
+
             item_cursor = conn.execute(
                 """
                 INSERT INTO orders_orderitem
@@ -1298,12 +1497,12 @@ def _checkout_order_sqlite(
             )
             order_item_id = int(item_cursor.lastrowid)
 
-            new_on_hand_milli = line['on_hand_milli'] - line['quantity_milli']
-            if new_on_hand_milli < 0 or new_on_hand_milli < line['reserved_milli']:
+            new_on_hand_milli = cur_on_hand - line['quantity_milli']
+            if new_on_hand_milli < 0 or new_on_hand_milli < cur_reserved:
                 raise InsufficientStockError(
                     f"Negative or over-reserved stock prevented for product_id={line['product_id']}."
                 )
-            new_version = line['version'] + 1
+            new_version = cur_version + 1
             conn.execute(
                 """
                 UPDATE products_warehousestockbalance
@@ -1409,9 +1608,15 @@ def _checkout_order_sqlite(
             (customer_id, idempotency_key),
         ).fetchone()
         if existing_order is not None:
-            raise IdempotencyConflictError(
-                f"Idempotency key '{idempotency_key}' is already claimed by another order for customer '{customer_id}'."
-            ) from exc
+            return _reconstruct_or_conflict_existing_order_sqlite(
+                conn,
+                existing_order_id=int(existing_order[0]),
+                customer_id=customer_id,
+                branch_id=branch_id,
+                fulfillment_warehouse_id=fulfillment_warehouse_id,
+                items=items,
+                idempotency_key=idempotency_key,
+            )
         raise
     except Exception:
         conn.execute(f'ROLLBACK TO SAVEPOINT {savepoint_name};')
@@ -2016,11 +2221,79 @@ def _cancel_order_sqlite(
         raise
 
 
+def _serialize_order_row_sqlite(
+    conn: sqlite3.Connection,
+    row: tuple[Any, ...],
+) -> dict[str, Any]:
+    oid = int(row[0])
+    cur_items = conn.execute(
+        """
+        SELECT id, product_id, product_name_snapshot, unit_snapshot,
+               quantity_milli, unit_price_halalas, line_total_halalas, created_at
+        FROM orders_orderitem
+        WHERE order_id = ?
+        ORDER BY id ASC
+        """,
+        (oid,),
+    ).fetchall()
+    items_payload = [
+        {
+            'id': int(r[0]),
+            'product': int(r[1]),
+            'product_id': int(r[1]),
+            'product_name_snapshot': str(r[2]),
+            'unit_snapshot': str(r[3]),
+            'quantity_milli': int(r[4]),
+            'unit_price_halalas': int(r[5]),
+            'line_total_halalas': int(r[6]),
+            'created_at': str(r[7]),
+        }
+        for r in cur_items
+    ]
+    cur_hist = conn.execute(
+        """
+        SELECT id, from_status, to_status, changed_by_actor_id, reason, changed_at
+        FROM orders_orderstatushistory
+        WHERE order_id = ?
+        ORDER BY id ASC
+        """,
+        (oid,),
+    ).fetchall()
+    hist_payload = [
+        {
+            'id': int(h[0]),
+            'from_status': h[1],
+            'to_status': str(h[2]),
+            'changed_by_actor_id': str(h[3]),
+            'reason': str(h[4]),
+            'changed_at': str(h[5]),
+        }
+        for h in cur_hist
+    ]
+    return {
+        'id': oid,
+        'branch': int(row[1]),
+        'branch_id': int(row[1]),
+        'fulfillment_warehouse': int(row[2]) if row[2] is not None else None,
+        'fulfillment_warehouse_id': int(row[2]) if row[2] is not None else None,
+        'customer_id': str(row[3]),
+        'status': str(row[4]),
+        'total_halalas': int(row[5]),
+        'idempotency_key': row[6],
+        'cancellation_restored': bool(row[7]),
+        'timestamp': str(row[8]),
+        'updated_at': str(row[9]),
+        'items': items_payload,
+        'status_history': hist_payload,
+    }
+
+
 def list_orders_for_actor_sqlite(
     conn: sqlite3.Connection,
     *,
     actor: ServiceActor,
     branch_id: int | None = None,
+    status: str | None = None,
 ) -> list[dict[str, Any]]:
     validated_actor = _validate_actor(actor)
     role_val = validated_actor.role.value if isinstance(validated_actor.role, ActorRole) else str(validated_actor.role)
@@ -2031,19 +2304,28 @@ def list_orders_for_actor_sqlite(
         cust_id = (validated_actor.customer_id or validated_actor.actor_id).strip()
         where_clauses.append("customer_id = ?")
         params.append(cust_id)
-    elif role_val == ActorRole.BRANCH_MANAGER.value:
-        allowed = sorted(validated_actor.authorized_branch_ids or ())
-        if not allowed:
-            return []
-        placeholders = ', '.join('?' for _ in allowed)
-        where_clauses.append(f"branch_id IN ({placeholders})")
-        params.extend(allowed)
+        if branch_id is not None:
+            where_clauses.append("branch_id = ?")
+            params.append(int(branch_id))
+    elif role_val in (ActorRole.BRANCH_MANAGER.value, ActorRole.OWNER.value):
+        if branch_id is not None:
+            if validated_actor.authorized_branch_ids is not None and int(branch_id) not in validated_actor.authorized_branch_ids:
+                raise AuthenticationBoundaryError(f"Actor is not authorized for branch {branch_id}.")
+            where_clauses.append("branch_id = ?")
+            params.append(int(branch_id))
+        elif validated_actor.authorized_branch_ids is not None:
+            allowed = sorted(validated_actor.authorized_branch_ids)
+            if not allowed:
+                return []
+            placeholders = ', '.join('?' for _ in allowed)
+            where_clauses.append(f"branch_id IN ({placeholders})")
+            params.extend(allowed)
+    else:
+        return []
 
-    if branch_id is not None:
-        if validated_actor.authorized_branch_ids is not None and branch_id not in validated_actor.authorized_branch_ids:
-            raise AuthenticationBoundaryError(f"Actor is not authorized for branch {branch_id}.")
-        where_clauses.append("branch_id = ?")
-        params.append(int(branch_id))
+    if status is not None and str(status).strip():
+        where_clauses.append("status = ?")
+        params.append(str(status).strip())
 
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     cur = conn.execute(
@@ -2056,24 +2338,42 @@ def list_orders_for_actor_sqlite(
         """,
         tuple(params),
     )
-    orders: list[dict[str, Any]] = []
-    for row in cur.fetchall():
-        oid = int(row[0])
-        orders.append(
-            {
-                'id': oid,
-                'branch': int(row[1]),
-                'branch_id': int(row[1]),
-                'fulfillment_warehouse': int(row[2]) if row[2] is not None else None,
-                'fulfillment_warehouse_id': int(row[2]) if row[2] is not None else None,
-                'customer_id': str(row[3]),
-                'status': str(row[4]),
-                'total_halalas': int(row[5]),
-                'idempotency_key': row[6],
-                'cancellation_restored': bool(row[7]),
-                'timestamp': str(row[8]),
-                'updated_at': str(row[9]),
-            }
-        )
-    return orders
+    return [_serialize_order_row_sqlite(conn, row) for row in cur.fetchall()]
+
+
+def get_order_detail_for_actor_sqlite(
+    conn: sqlite3.Connection,
+    *,
+    order_id: int,
+    actor: ServiceActor,
+) -> dict[str, Any]:
+    validated_actor = _validate_actor(actor)
+    role_val = validated_actor.role.value if isinstance(validated_actor.role, ActorRole) else str(validated_actor.role)
+    row = conn.execute(
+        """
+        SELECT id, branch_id, fulfillment_warehouse_id, customer_id, status,
+               total_halalas, idempotency_key, cancellation_restored, timestamp, updated_at
+        FROM orders_order
+        WHERE id = ?
+        """,
+        (order_id,),
+    ).fetchone()
+    if row is None:
+        raise CheckoutResourceNotFoundError(f"Order #{order_id} was not found.")
+
+    order_branch_id = int(row[1])
+    order_customer_id = str(row[3])
+
+    if role_val == ActorRole.CUSTOMER.value:
+        cust_id = (validated_actor.customer_id or validated_actor.actor_id).strip()
+        if order_customer_id != cust_id:
+            raise AuthenticationBoundaryError("Customer actor is not authorized to access another customer's order.")
+    elif role_val in (ActorRole.BRANCH_MANAGER.value, ActorRole.OWNER.value):
+        if validated_actor.authorized_branch_ids is not None and order_branch_id not in validated_actor.authorized_branch_ids:
+            raise AuthenticationBoundaryError(f"Actor is not authorized for branch {order_branch_id}.")
+    else:
+        raise AuthenticationBoundaryError("Actor is not authorized to access order details.")
+
+    return _serialize_order_row_sqlite(conn, row)
+
 

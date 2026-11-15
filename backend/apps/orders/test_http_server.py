@@ -13,10 +13,23 @@ from __future__ import annotations
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import sqlite3
 import sys
 import threading
 from urllib.parse import parse_qs, urlparse
+
+os.environ.setdefault("DJANGO_ENV", "development")
+os.environ.setdefault("DEBUG", "True")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "fresh_api.settings")
+try:
+    import django
+    from django.conf import settings as _django_settings
+
+    if not _django_settings.configured:
+        django.setup()
+except Exception:
+    pass
 
 from apps.orders.auth import (
     GENERIC_INVALID_ACCESS_TOKEN_MESSAGE,
@@ -32,21 +45,35 @@ from apps.orders.auth import (
     revoke_token_session_sqlite,
     rotate_session_token_sqlite,
 )
+from apps.orders.serializers import (
+    CancelOrderRequestSerializer,
+    CheckoutRequestSerializer,
+    OrderStatusTransitionRequestSerializer,
+    serializers,
+)
 from apps.orders.services import (
     FORBIDDEN_ITEM_FIELDS,
     FORBIDDEN_ORDER_CHECKOUT_FIELDS,
     AuthenticationBoundaryError,
+    BranchWarehouseMismatchError,
     CheckoutResourceNotFoundError,
     CheckoutValidationError,
     IdempotencyConflictError,
     InsufficientStockError,
+    InvalidOrderStatusTransitionError,
+    MissingStockBalanceError,
+    OrderCancellationError,
     ServiceActor,
     SpoofedFinancialDataError,
+    cancel_order,
     checkout_order,
+    get_order_detail_for_actor_sqlite,
     install_sqlite_append_only_triggers,
     list_orders_for_actor_sqlite,
+    transition_order_status,
 )
 from middleware.auth_rate_limit import HttpRequest
+import re
 
 
 def list_public_or_branch_categories_sqlite(
@@ -140,7 +167,8 @@ class _SimpleRequestAdapter:
         for k, v in headers.items():
             meta['HTTP_' + k.upper().replace('-', '_')] = v
         self.META = meta
-        self._request = HttpRequest(method=self.method, path=path, meta=meta, body=raw_body)
+        self._request = self
+        self._skip_orm_throttle_audit = True
         self.user = None
 
 
@@ -304,10 +332,25 @@ def create_seeded_sqlite_connection() -> sqlite3.Connection:
         "INSERT INTO products_store (id, code, name, is_active) VALUES (1, 'FRESH-KSA', 'فريش السعودية', 1)"
     )
     conn.execute(
+        "INSERT INTO products_store (id, code, name, is_active) VALUES (2, 'OTHER-KSA', 'متجر آخر', 1)"
+    )
+    conn.execute(
         "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (1, 1, 'RUH-01', 'فرع الرياض', 1)"
     )
     conn.execute(
+        "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (2, 1, 'JED-01', 'فرع جدة', 1)"
+    )
+    conn.execute(
+        "INSERT INTO products_branch (id, store_id, code, name, is_active) VALUES (3, 2, 'DMM-01', 'فرع الدمام', 1)"
+    )
+    conn.execute(
         "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (1, 1, 'WH-RUH-01', 'مستودع الرياض الرئيسي', 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (2, 2, 'WH-JED-01', 'مستودع جدة الرئيسي', 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO products_warehouse (id, branch_id, code, name, is_primary_fulfillment, is_active) VALUES (3, 3, 'WH-DMM-01', 'مستودع الدمام الرئيسي', 1, 1)"
     )
     conn.execute(
         "INSERT INTO products_category (id, name, display_order, is_active) VALUES (1, 'خضروات طازجة', 1, 1)"
@@ -333,12 +376,15 @@ def create_seeded_sqlite_connection() -> sqlite3.Connection:
         )
         """
     )
-    conn.execute(
-        "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 1, 50000, 0, 1)"
-    )
-    conn.execute(
-        "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (1, 2, 50000, 0, 1)"
-    )
+    for wh_id in (1, 2, 3):
+        conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (?, 1, 50000, 0, 1)",
+            (wh_id,),
+        )
+        conn.execute(
+            "INSERT INTO products_warehousestockbalance (warehouse_id, product_id, on_hand_milli, reserved_milli, version) VALUES (?, 2, 50000, 0, 1)",
+            (wh_id,),
+        )
 
     # Seed pre-provisioned OWNER and BRANCH_MANAGER accounts for role-based login verification
     owner_pw = hash_password_pbkdf2_sha256('OwnerPass123')
@@ -383,6 +429,50 @@ def create_seeded_sqlite_connection() -> sqlite3.Connection:
         (mgr_prof_id,),
     )
 
+    # Second branch manager assigned to Branch 2 (Jeddah) in Store 1
+    mgr2_pw = hash_password_pbkdf2_sha256('ManagerJedPass123')
+    cur_mgr2 = conn.execute(
+        """
+        INSERT INTO auth_user (password, is_superuser, username, first_name, last_name, email, is_staff, is_active)
+        VALUES (?, 0, 'manager_jed@fresh.sa', 'مشرف', 'جدة', 'manager_jed@fresh.sa', 1, 1)
+        """,
+        (mgr2_pw,),
+    )
+    mgr2_user_id = int(cur_mgr2.lastrowid)
+    cur_mgr2_prof = conn.execute(
+        """
+        INSERT INTO orders_useridentityprofile (user_id, role, customer_id, store_id, is_active)
+        VALUES (?, 'BRANCH_MANAGER', NULL, 1, 1)
+        """,
+        (mgr2_user_id,),
+    )
+    mgr2_prof_id = int(cur_mgr2_prof.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO orders_branchroleassignment (profile_id, branch_id, is_active)
+        VALUES (?, 2, 1)
+        """,
+        (mgr2_prof_id,),
+    )
+
+    # Second store owner assigned to Store 2 (Branch 3 - Dammam)
+    owner2_pw = hash_password_pbkdf2_sha256('Owner2Pass123')
+    cur_owner2 = conn.execute(
+        """
+        INSERT INTO auth_user (password, is_superuser, username, first_name, last_name, email, is_staff, is_active)
+        VALUES (?, 0, 'owner2@other.sa', 'مالك', 'آخر', 'owner2@other.sa', 1, 1)
+        """,
+        (owner2_pw,),
+    )
+    owner2_user_id = int(cur_owner2.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO orders_useridentityprofile (user_id, role, customer_id, store_id, is_active)
+        VALUES (?, 'OWNER', NULL, 2, 1)
+        """,
+        (owner2_user_id,),
+    )
+
     conn.commit()
     return conn
 
@@ -391,6 +481,7 @@ class FreshContractHttpServer:
     def __init__(self, host: str = '127.0.0.1', port: int = 0):
         self.conn = create_seeded_sqlite_connection()
         self.lock = threading.Lock()
+        self.before_order_insert_hook = None
         parent = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -617,14 +708,18 @@ class FreshContractHttpServer:
                         if method == 'GET' and norm_path == '/api/v1/orders':
                             try:
                                 enforce_no_client_identity_spoofing(req_adapter, actor)
+                                raw_branch_param = query_params.get('branch_id') or query_params.get('branch')
+                                parsed_branch_id: int | None = None
+                                if raw_branch_param is not None:
+                                    if not str(raw_branch_param).isdigit() or int(raw_branch_param) <= 0:
+                                        self._send_json(403, {'detail': 'Invalid branch_id query parameter.'})
+                                        return
+                                    parsed_branch_id = int(raw_branch_param)
                                 rows = list_orders_for_actor_sqlite(
                                     parent.conn,
                                     actor=actor,
-                                    branch_id=(
-                                        int(query_params['branch_id'])
-                                        if 'branch_id' in query_params and str(query_params['branch_id']).isdigit()
-                                        else None
-                                    ),
+                                    branch_id=parsed_branch_id,
+                                    status=query_params.get('status'),
                                 )
                                 self._send_json(200, rows)
                             except AuthenticationBoundaryError as exc:
@@ -634,40 +729,15 @@ class FreshContractHttpServer:
                         if method == 'POST':
                             try:
                                 enforce_no_client_identity_spoofing(req_adapter, actor)
+                                if actor.role != 'CUSTOMER':
+                                    self._send_json(
+                                        403,
+                                        {'detail': 'Only authenticated CUSTOMER actors may place orders via checkout.'},
+                                    )
+                                    return
                                 if not isinstance(data, dict):
                                     self._send_json(400, {'detail': 'Checkout payload must be a JSON object.'})
                                     return
-
-                                forbidden_top = sorted(set(data.keys()) & FORBIDDEN_ORDER_CHECKOUT_FIELDS)
-                                if forbidden_top:
-                                    self._send_json(
-                                        400,
-                                        {
-                                            'detail': (
-                                                f"Forbidden client fields in checkout payload: {', '.join(forbidden_top)}."
-                                            )
-                                        },
-                                    )
-                                    return
-
-                                raw_items = data.get('items')
-                                if not isinstance(raw_items, list) or len(raw_items) == 0:
-                                    self._send_json(400, {'detail': 'Checkout requires at least one order item.'})
-                                    return
-                                for idx, raw_item in enumerate(raw_items):
-                                    if isinstance(raw_item, dict):
-                                        forbidden_item = sorted(set(raw_item.keys()) & FORBIDDEN_ITEM_FIELDS)
-                                        if forbidden_item:
-                                            self._send_json(
-                                                400,
-                                                {
-                                                    'detail': (
-                                                        f"Item #{idx + 1} contains forbidden client fields: "
-                                                        f"{', '.join(forbidden_item)}."
-                                                    )
-                                                },
-                                            )
-                                            return
 
                                 header_idem = None
                                 for hk, hv in headers_dict.items():
@@ -675,7 +745,223 @@ class FreshContractHttpServer:
                                         header_idem = str(hv).strip()
                                         break
                                 body_idem_raw = data.get('idempotency_key')
-                                body_idem = str(body_idem_raw).strip() if body_idem_raw is not None and str(body_idem_raw).strip() else None
+                                body_idem = (
+                                    str(body_idem_raw).strip()
+                                    if body_idem_raw is not None and str(body_idem_raw).strip()
+                                    else None
+                                )
+                                if header_idem and body_idem and header_idem != body_idem:
+                                    raise IdempotencyConflictError(
+                                        'Idempotency-Key header and body idempotency_key do not match.'
+                                    )
+                                idem_key = header_idem or body_idem
+
+                                serializer_input = dict(data)
+                                if idem_key and 'idempotency_key' not in serializer_input:
+                                    serializer_input['idempotency_key'] = idem_key
+
+                                serializer = CheckoutRequestSerializer(data=serializer_input)
+                                serializer.is_valid(raise_exception=True)
+                                validated = serializer.validated_data
+
+                                result = checkout_order(
+                                    actor=actor,
+                                    branch_id=validated['branch_id'],
+                                    items=[
+                                        {
+                                            'product_id': item['product_id'],
+                                            'quantity_milli': item['quantity_milli'],
+                                            'client_unit_price_halalas': item.get('unit_price_halalas'),
+                                            'client_line_total_halalas': item.get('line_total_halalas'),
+                                            'expected_unit_price_halalas': item.get('expected_unit_price_halalas'),
+                                        }
+                                    for item in validated['items']
+                                    ],
+                                    idempotency_key=validated['idempotency_key'],
+                                    warehouse_id=validated.get('warehouse_id'),
+                                    customer_id=actor.customer_id,
+                                    client_total_halalas=validated.get('total_halalas'),
+                                    expected_total_halalas=validated.get('expected_total_halalas'),
+                                    reject_client_pricing=bool(validated.get('reject_client_pricing', False)),
+                                    conn=parent.conn,
+                                    _on_before_order_insert_hook=parent.before_order_insert_hook,
+                                )
+
+                                order_response = get_order_detail_for_actor_sqlite(
+                                    parent.conn,
+                                    order_id=result.order_id,
+                                    actor=actor,
+                                )
+                                order_response['replayed'] = result.replayed
+                                status_code = 200 if result.replayed else 201
+                                self._send_json(status_code, order_response)
+                            except AuthenticationBoundaryError as exc:
+                                self._send_json(403, {'detail': str(exc), 'code': 'authorization_denied'})
+                            except serializers.ValidationError as exc:
+                                self._send_json(
+                                    400,
+                                    {
+                                        'detail': str(exc),
+                                        'code': 'validation_error',
+                                        'errors': exc.detail if hasattr(exc, 'detail') else str(exc),
+                                    },
+                                )
+                            except CheckoutResourceNotFoundError as exc:
+                                self._send_json(404, {'detail': str(exc), 'code': 'not_found'})
+                            except (InsufficientStockError, IdempotencyConflictError) as exc:
+                                err_code = (
+                                    'insufficient_stock'
+                                    if isinstance(exc, InsufficientStockError)
+                                    else 'idempotency_conflict'
+                                )
+                                self._send_json(409, {'detail': str(exc), 'code': err_code})
+                            except (
+                                SpoofedFinancialDataError,
+                                CheckoutValidationError,
+                                BranchWarehouseMismatchError,
+                            ) as exc:
+                                self._send_json(400, {'detail': str(exc), 'code': 'validation_error'})
+                            except Exception:
+                                self._send_json(
+                                    500,
+                                    {
+                                        'detail': (
+                                            'An internal error occurred while processing the checkout transaction.'
+                                        ),
+                                        'code': 'internal_server_error',
+                                    },
+                                )
+                            return
+
+                    # 8. Order Detail, Status Transition & Cancellation (/api/v1/orders/<id>[/transition-status|/status|/cancel])
+                    order_route_match = re.match(
+                        r'^/api/v1/orders/(?P<order_id>\d+)(?:/(?P<action>transition-status|status|cancel))?$',
+                        norm_path,
+                    )
+                    if order_route_match:
+                        if not auth_header.strip():
+                            self._send_json(401, {'detail': 'Authentication credentials were not provided.'})
+                            return
+                        try:
+                            me_payload = authenticate_access_token_sqlite(parent.conn, auth_header)
+                            actor = ServiceActor(
+                                actor_id=me_payload['actor_id'],
+                                role=me_payload['role'],
+                                customer_id=me_payload['customer_id'],
+                                store_id=me_payload.get('store_id'),
+                                authorized_branch_ids=(
+                                    frozenset(me_payload['authorized_branch_ids'])
+                                    if me_payload['authorized_branch_ids'] is not None
+                                    else None
+                                ),
+                            )
+                        except AuthenticationBoundaryError:
+                            self._send_json(401, {'detail': GENERIC_INVALID_ACCESS_TOKEN_MESSAGE})
+                            return
+
+                        target_order_id = int(order_route_match.group('order_id'))
+                        action_name = order_route_match.group('action')
+
+                        if method == 'GET' and action_name is None:
+                            try:
+                                enforce_no_client_identity_spoofing(req_adapter, actor)
+                                order_payload = get_order_detail_for_actor_sqlite(
+                                    parent.conn,
+                                    order_id=target_order_id,
+                                    actor=actor,
+                                )
+                                self._send_json(200, order_payload)
+                            except CheckoutResourceNotFoundError as exc:
+                                self._send_json(404, {'detail': str(exc)})
+                            except AuthenticationBoundaryError as exc:
+                                self._send_json(403, {'detail': str(exc)})
+                            return
+
+                        if method == 'POST' and action_name in ('transition-status', 'status'):
+                            try:
+                                enforce_no_client_identity_spoofing(req_adapter, actor)
+                                if actor.role not in ('BRANCH_MANAGER', 'OWNER'):
+                                    self._send_json(
+                                        403,
+                                        {'detail': 'Only authorized BRANCH_MANAGER or OWNER accounts may transition order status.'},
+                                    )
+                                    return
+                                # Verify object exists and caller is authorized for its branch
+                                get_order_detail_for_actor_sqlite(
+                                    parent.conn,
+                                    order_id=target_order_id,
+                                    actor=actor,
+                                )
+                                req_serializer = OrderStatusTransitionRequestSerializer(data=data)
+                                req_serializer.is_valid(raise_exception=True)
+                                validated = req_serializer.validated_data
+                                transition_res = transition_order_status(
+                                    actor=actor,
+                                    order_id=target_order_id,
+                                    to_status=validated['to_status'],
+                                    reason=validated.get('reason', ''),
+                                    sqlite_conn=parent.conn,
+                                )
+                                parent.conn.commit()
+                                updated_payload = get_order_detail_for_actor_sqlite(
+                                    parent.conn,
+                                    order_id=target_order_id,
+                                    actor=actor,
+                                )
+                                updated_payload['transition'] = {
+                                    'from_status': transition_res.from_status,
+                                    'to_status': transition_res.to_status,
+                                    'changed_by_actor_id': transition_res.changed_by_actor_id,
+                                    'reason': transition_res.reason,
+                                }
+                                self._send_json(200, updated_payload)
+                            except CheckoutResourceNotFoundError as exc:
+                                self._send_json(404, {'detail': str(exc)})
+                            except AuthenticationBoundaryError as exc:
+                                self._send_json(403, {'detail': str(exc)})
+                            except serializers.ValidationError as exc:
+                                self._send_json(
+                                    400,
+                                    {
+                                        'detail': str(exc),
+                                        'code': 'validation_error',
+                                        'errors': exc.detail if hasattr(exc, 'detail') else str(exc),
+                                    },
+                                )
+                            except InvalidOrderStatusTransitionError as exc:
+                                self._send_json(400, {'detail': str(exc)})
+                            return
+
+                        if method == 'POST' and action_name == 'cancel':
+                            try:
+                                enforce_no_client_identity_spoofing(req_adapter, actor)
+                                if actor.role not in ('BRANCH_MANAGER', 'OWNER'):
+                                    self._send_json(
+                                        403,
+                                        {'detail': 'Only authorized BRANCH_MANAGER or OWNER accounts may cancel orders.'},
+                                    )
+                                    return
+                                # Verify object exists and caller is authorized for its branch
+                                get_order_detail_for_actor_sqlite(
+                                    parent.conn,
+                                    order_id=target_order_id,
+                                    actor=actor,
+                                )
+                                req_serializer = CancelOrderRequestSerializer(data=data)
+                                req_serializer.is_valid(raise_exception=True)
+                                validated = req_serializer.validated_data
+
+                                header_idem = None
+                                for hk, hv in headers_dict.items():
+                                    if hk.lower() in ('idempotency-key', 'x-idempotency-key') and str(hv).strip():
+                                        header_idem = str(hv).strip()
+                                        break
+                                body_idem_raw = validated.get('idempotency_key') or data.get('idempotency_key')
+                                body_idem = (
+                                    str(body_idem_raw).strip()
+                                    if body_idem_raw is not None and str(body_idem_raw).strip()
+                                    else None
+                                )
                                 if header_idem and body_idem and header_idem != body_idem:
                                     raise IdempotencyConflictError(
                                         'Idempotency-Key header and body idempotency_key do not match.'
@@ -684,109 +970,51 @@ class FreshContractHttpServer:
                                 if not idem_key:
                                     self._send_json(
                                         400,
-                                        {'detail': 'idempotency_key is required via Idempotency-Key header or request body.'},
+                                        {'detail': 'idempotency_key is required (in body or Idempotency-Key header).'},
                                     )
                                     return
 
-                                result = checkout_order(
+                                cancel_res = cancel_order(
                                     actor=actor,
-                                    branch_id=data.get('branch_id'),  # type: ignore[arg-type]
-                                    items=raw_items,
+                                    order_id=target_order_id,
                                     idempotency_key=idem_key,
-                                    warehouse_id=data.get('warehouse_id'),
-                                    customer_id=actor.customer_id,
-                                    client_total_halalas=data.get('total_halalas'),
-                                    expected_total_halalas=data.get('expected_total_halalas'),
-                                    reject_client_pricing=bool(data.get('reject_client_pricing', False)),
-                                    conn=parent.conn,
+                                    reason=validated.get('reason', 'Order cancelled and stock restored'),
+                                    sqlite_conn=parent.conn,
                                 )
-
-                                cur_order = parent.conn.execute(
-                                    "SELECT timestamp, updated_at FROM orders_order WHERE id = ?",
-                                    (result.order_id,),
-                                ).fetchone()
-                                ts_val = str(cur_order[0]) if cur_order else ''
-                                up_val = str(cur_order[1]) if cur_order else ''
-                                cur_items = parent.conn.execute(
-                                    """
-                                    SELECT id, product_id, product_name_snapshot, unit_snapshot,
-                                           quantity_milli, unit_price_halalas, line_total_halalas, created_at
-                                    FROM orders_orderitem
-                                    WHERE order_id = ?
-                                    ORDER BY id ASC
-                                    """,
-                                    (result.order_id,),
-                                ).fetchall()
-                                items_payload = [
-                                    {
-                                        'id': int(r[0]),
-                                        'product': int(r[1]),
-                                        'product_id': int(r[1]),
-                                        'product_name_snapshot': str(r[2]),
-                                        'unit_snapshot': str(r[3]),
-                                        'quantity_milli': int(r[4]),
-                                        'unit_price_halalas': int(r[5]),
-                                        'line_total_halalas': int(r[6]),
-                                        'created_at': str(r[7]),
-                                    }
-                                    for r in cur_items
+                                parent.conn.commit()
+                                updated_payload = get_order_detail_for_actor_sqlite(
+                                    parent.conn,
+                                    order_id=target_order_id,
+                                    actor=actor,
+                                )
+                                updated_payload['replayed'] = cancel_res.replayed
+                                updated_payload['from_status'] = cancel_res.from_status
+                                updated_payload['restored_items'] = [
+                                    {'product_id': prod_id, 'quantity_milli': qty}
+                                    for prod_id, qty in cancel_res.restored_items
                                 ]
-                                cur_hist = parent.conn.execute(
-                                    """
-                                    SELECT id, from_status, to_status, changed_by_actor_id, reason, changed_at
-                                    FROM orders_orderstatushistory
-                                    WHERE order_id = ?
-                                    ORDER BY id ASC
-                                    """,
-                                    (result.order_id,),
-                                ).fetchall()
-                                hist_payload = [
-                                    {
-                                        'id': int(h[0]),
-                                        'from_status': h[1],
-                                        'to_status': str(h[2]),
-                                        'changed_by_actor_id': str(h[3]),
-                                        'reason': str(h[4]),
-                                        'changed_at': str(h[5]),
-                                    }
-                                    for h in cur_hist
-                                ]
-                                order_response = {
-                                    'id': result.order_id,
-                                    'branch': result.branch_id,
-                                    'branch_id': result.branch_id,
-                                    'fulfillment_warehouse': result.warehouse_id,
-                                    'fulfillment_warehouse_id': result.warehouse_id,
-                                    'customer_id': result.customer_id,
-                                    'status': result.status,
-                                    'total_halalas': result.total_halalas,
-                                    'idempotency_key': result.idempotency_key,
-                                    'cancellation_restored': False,
-                                    'timestamp': ts_val,
-                                    'updated_at': up_val,
-                                    'items': items_payload,
-                                    'status_history': hist_payload,
-                                    'replayed': result.replayed,
-                                }
-                                status_code = 200 if result.replayed else 201
-                                self._send_json(status_code, order_response)
-                            except AuthenticationBoundaryError as exc:
-                                self._send_json(403, {'detail': str(exc)})
+                                self._send_json(200, updated_payload)
                             except CheckoutResourceNotFoundError as exc:
                                 self._send_json(404, {'detail': str(exc)})
-                            except (InsufficientStockError, IdempotencyConflictError) as exc:
-                                self._send_json(409, {'detail': str(exc)})
-                            except (SpoofedFinancialDataError, CheckoutValidationError) as exc:
-                                self._send_json(400, {'detail': str(exc)})
-                            except Exception:
+                            except AuthenticationBoundaryError as exc:
+                                self._send_json(403, {'detail': str(exc)})
+                            except serializers.ValidationError as exc:
                                 self._send_json(
-                                    500,
+                                    400,
                                     {
-                                        'detail': (
-                                            'An internal error occurred while processing the checkout transaction.'
-                                        )
+                                        'detail': str(exc),
+                                        'code': 'validation_error',
+                                        'errors': exc.detail if hasattr(exc, 'detail') else str(exc),
                                     },
                                 )
+                            except (IdempotencyConflictError, OrderCancellationError) as exc:
+                                self._send_json(409, {'detail': str(exc)})
+                            except (
+                                InvalidOrderStatusTransitionError,
+                                BranchWarehouseMismatchError,
+                                MissingStockBalanceError,
+                            ) as exc:
+                                self._send_json(400, {'detail': str(exc)})
                             return
 
                     self._send_json(404, {'detail': 'Not found.'})
